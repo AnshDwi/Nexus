@@ -9,3 +9,7 @@ dist/
 build/
 .coverage
 htmlcov/
+
+# Vercel
+.vercel/
+_vc_queue_handlers/

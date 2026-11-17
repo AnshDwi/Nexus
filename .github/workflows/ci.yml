@@ -4,15 +4,21 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
 
@@ -28,12 +34,13 @@ jobs:
       - name: Mypy
         run: uv run mypy src
 
-      - name: Pytest
+      - name: Pytest (unit)
         run: uv run pytest
 
   integration:
     runs-on: ubuntu-latest
     needs: test
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:16-alpine
@@ -64,7 +71,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
 
@@ -74,5 +81,104 @@ jobs:
       - name: Apply migrations
         run: uv run alembic upgrade head
 
-      - name: Integration tests
+      - name: Models and migrations are in sync
+        run: uv run alembic check
+
+      - name: Migrations are reversible
+        run: uv run alembic downgrade base && uv run alembic upgrade head
+
+      - name: Integration tests (Postgres, RabbitMQ, embedded Vercel Queues)
         run: uv run pytest -m integration
+
+  # Runs Vercel's real Python builder offline (no token needed) to prove the
+  # project still produces the API function, the queue-triggered consumer
+  # and the cron. Catches entrypoint/subscriber misconfiguration before deploy.
+  vercel-build:
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Vercel CLI
+        run: npm install -g vercel@latest
+      - name: Build with a local project stub
+        run: |
+          mkdir -p .vercel
+          echo '{"projectId":"prj_ci","orgId":"team_ci","settings":{"framework":null}}' > .vercel/project.json
+          vercel build --yes
+      - name: Assert build output
+        run: |
+          python3 - <<'PY'
+          import json, glob
+          cfg = json.load(open(".vercel/output/config.json"))
+          assert any(c["path"] == "/api/v1/internal/maintenance" for c in cfg.get("crons", [])), "cron missing"
+          funcs = glob.glob(".vercel/output/functions/**/.vc-config.json", recursive=True)
+          triggers = [t for f in funcs for t in json.load(open(f)).get("experimentalTriggers", [])]
+          assert any(t["topic"] == "nexus-task-dispatch" and t["consumer"] == "nexus-executor"
+                     for t in triggers), f"queue consumer missing: {triggers}"
+          assert any(f.endswith("fastapi.func/.vc-config.json") for f in funcs), "API function missing"
+          print("vercel build output OK:", len(funcs), "functions,", triggers)
+          PY
+
+  # Production deploy: migrate first (expand/contract-compatible migrations
+  # only), then build and deploy, then verify end to end against the live URL.
+  # Requires repository secrets: VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID,
+  # DATABASE_URL_UNPOOLED (production, direct connection), NEXUS_VERIFY_API_KEY
+  # (a key whose hash is in production API_KEYS), and optionally
+  # VERCEL_AUTOMATION_BYPASS_SECRET if Deployment Protection is on.
+  deploy-production:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: [test, integration, vercel-build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    env:
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check deployment secrets are configured
+        id: guard
+        run: |
+          if [ -z "${{ secrets.VERCEL_TOKEN }}" ]; then
+            echo "VERCEL_TOKEN not configured; skipping deploy." && echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: astral-sh/setup-uv@v6
+        if: steps.guard.outputs.skip != 'true'
+        with:
+          enable-cache: true
+      - uses: actions/setup-node@v4
+        if: steps.guard.outputs.skip != 'true'
+        with:
+          node-version: 22
+      - name: Install
+        if: steps.guard.outputs.skip != 'true'
+        run: uv sync --locked && npm install -g vercel@latest
+      - name: Migrate production database
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          # Settings' production guard requires API_KEYS; the migration
+          # process serves no requests, so a placeholder digest is enough.
+          ENVIRONMENT: migration
+          API_KEYS: "migrate:0000000000000000000000000000000000000000000000000000000000000000"
+          DATABASE_URL: ${{ secrets.DATABASE_URL_UNPOOLED }}
+          DATABASE_URL_UNPOOLED: ${{ secrets.DATABASE_URL_UNPOOLED }}
+        run: uv run alembic upgrade head
+      - name: Build and deploy
+        if: steps.guard.outputs.skip != 'true'
+        id: deploy
+        run: |
+          vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+          vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+          url=$(vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }})
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+      - name: Verify deployment end to end
+        if: steps.guard.outputs.skip != 'true'
+        run: >
+          uv run python -m nexus.cli verify-deployment "${{ steps.deploy.outputs.url }}"
+          --api-key "${{ secrets.NEXUS_VERIFY_API_KEY }}"
+          --protection-bypass "${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}"
+          --timeout 120

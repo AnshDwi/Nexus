@@ -1,0 +1,16 @@
+INFO:     Started server process [2708]
+INFO:     Waiting for application startup.
+{"ts": "2026-11-17T10:40:27.510185+00:00", "level": "INFO", "logger": "nexus.api", "msg": "nexus api started", "environment": "production", "event_bus": "vercel_queues"}
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8100 (Press CTRL+C to quit)
+INFO:     127.0.0.1:53036 - "GET /api/v1/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53036 - "GET /api/v1/ready HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53036 - "GET /api/v1/tasks HTTP/1.1" 401 Unauthorized
+{"ts": "2026-11-17T10:40:31.935069+00:00", "level": "INFO", "logger": "nexus.scheduler.admission", "msg": "task admitted", "request_id": "9cddcf088a5e4ef880c564c6db1409de", "task_id": "8c8703f7-308c-4503-a02e-506b5fe71faf", "outcome": "accepted", "reason": "all validation rules passed and the task is schedulable"}
+INFO:     127.0.0.1:53036 - "POST /api/v1/tasks HTTP/1.1" 201 Created
+INFO:     127.0.0.1:53036 - "GET /api/v1/tasks/8c8703f7-308c-4503-a02e-506b5fe71faf HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53036 - "GET /api/v1/tasks/8c8703f7-308c-4503-a02e-506b5fe71faf HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [2708]

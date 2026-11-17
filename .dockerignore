@@ -1,0 +1,11 @@
+.git
+.venv
+.vercel
+_vc_queue_handlers
+.mypy_cache
+.pytest_cache
+.ruff_cache
+tests
+docs
+.env
+.env.*

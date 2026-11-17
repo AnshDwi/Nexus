@@ -88,3 +88,44 @@ scheduler_admission_evaluation_seconds = Histogram(
     "scheduler_admission_evaluation_seconds",
     "Latency of a single admission evaluation (in-process, no I/O).",
 )
+
+# Task execution metrics.
+#
+# On Vercel Functions each instance keeps its own registry, so these are
+# per-instance counters; the durable source of truth for task outcomes is the
+# tasks / task_transitions tables (see docs/vercel-deployment.md).
+task_submissions_total = Counter(
+    "nexus_task_submissions_total",
+    "Task submissions by outcome (created, duplicate, rejected).",
+    ["outcome"],
+)
+
+task_claims_total = Counter(
+    "nexus_task_claims_total",
+    "Dispatch deliveries by claim outcome (claimed, stale, deferred, ...).",
+    ["outcome"],
+)
+
+task_executions_total = Counter(
+    "nexus_task_executions_total",
+    "Task attempts executed, by task type and outcome.",
+    ["task_type", "outcome"],
+)
+
+task_execution_seconds = Histogram(
+    "nexus_task_execution_seconds",
+    "Wall-clock duration of a task attempt's handler.",
+    ["task_type"],
+)
+
+reconciler_repairs_total = Counter(
+    "nexus_reconciler_repairs_total",
+    "Repairs made by the reconciler, by kind.",
+    ["kind"],
+)
+
+outbox_relayed_total = Counter(
+    "nexus_outbox_relayed_total",
+    "Outbox rows handled by a relay pass, by trigger (eager, sweep, daemon).",
+    ["trigger"],
+)

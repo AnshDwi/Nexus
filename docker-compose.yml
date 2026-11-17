@@ -1,24 +1,53 @@
+# Local stack mirroring the Vercel topology:
+#   api        -> Vercel Function (FastAPI)
+#   queue      -> Vercel Queues (the official SDK's local devserver)
+#   scheduler  -> Vercel Daemon `scheduler` (reconciler + outbox relay)
+#   worker     -> poll-mode executor (on Vercel the push-mode subscriber
+#                 function does this; locally nothing pushes, so we poll)
+#   migrate    -> the CI "migrate" step
+# None of this is deployed by Vercel: on Vercel these are Functions, Queues,
+# Daemons and a Marketplace Postgres (see docs/vercel-deployment.md).
+x-nexus-env: &nexus-env
+  POSTGRES_HOST: postgres
+  REDIS_HOST: redis
+  RABBITMQ_HOST: rabbitmq
+  EVENT_BUS: vercel_queues
+  VERCEL_QUEUE_BASE_URL: http://queue:9100
+  VERCEL_QUEUE_TOKEN: local-token
+  VERCEL_QUEUE_REGION: iad1
+  VERCEL_QUEUE_DEPLOYMENT: all
+
 services:
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment: *nexus-env
+    env_file:
+      - path: .env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  queue:
+    build: .
+    command: ["python", "-m", "vercel.queue.devserver", "--host", "0.0.0.0", "--port", "9100"]
+    ports:
+      - "9100:9100"
+
   api:
     build: .
     ports:
       - "8000:8000"
-    environment:
-      POSTGRES_HOST: postgres
-      REDIS_HOST: redis
-      RABBITMQ_HOST: rabbitmq
+    environment: *nexus-env
     env_file:
-      - .env
+      - path: .env
+        required: false
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
-    volumes:
-      - ./src:/app/src
-      - ./migrations:/app/migrations
+      migrate:
+        condition: service_completed_successfully
+      queue:
+        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
       interval: 10s
@@ -26,22 +55,41 @@ services:
       retries: 5
       start_period: 10s
 
+  scheduler:
+    build: .
+    command: ["python", "-m", "nexus.daemon", "scheduler"]
+    environment: *nexus-env
+    env_file:
+      - path: .env
+        required: false
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      queue:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+
   worker:
     build: .
-    command: ["python", "-m", "nexus.worker"]
-    environment:
-      POSTGRES_HOST: postgres
-      RABBITMQ_HOST: rabbitmq
+    command: ["python", "-m", "nexus.daemon", "worker"]
+    environment: *nexus-env
     env_file:
-      - .env
+      - path: .env
+        required: false
     depends_on:
-      postgres:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
-    volumes:
-      - ./src:/app/src
-      - ./migrations:/app/migrations
+      migrate:
+        condition: service_completed_successfully
+      queue:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
 
   postgres:
     image: postgres:16-alpine
@@ -50,7 +98,7 @@ services:
       POSTGRES_PASSWORD: nexus
       POSTGRES_DB: nexus
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -59,24 +107,29 @@ services:
       timeout: 5s
       retries: 10
 
+  # Optional: only used when REDIS_ENABLED=true / REDIS_URL is set.
   redis:
     image: redis:7-alpine
+    profiles: ["redis"]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 10
 
+  # Optional: the original AMQP adapter (EVENT_BUS=rabbitmq) and its
+  # integration test. Not used by the Vercel deployment.
   rabbitmq:
     image: rabbitmq:3-management-alpine
+    profiles: ["rabbitmq"]
     environment:
       RABBITMQ_DEFAULT_USER: nexus
       RABBITMQ_DEFAULT_PASS: nexus
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 5s

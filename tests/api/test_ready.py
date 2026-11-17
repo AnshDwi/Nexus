@@ -71,7 +71,7 @@ async def test_ready_reports_degraded_when_redis_unavailable(client):
     response = await client.get("/api/v1/ready")
 
     body = response.json()
-    assert response.status_code == 200
+    assert response.status_code == 503
     assert body["status"] == "degraded"
     assert body["redis"].startswith("error")
     assert body["postgres"] == "ok"
@@ -83,7 +83,7 @@ async def test_ready_reports_degraded_when_postgres_unavailable(client):
     response = await client.get("/api/v1/ready")
 
     body = response.json()
-    assert response.status_code == 200
+    assert response.status_code == 503
     assert body["status"] == "degraded"
     assert body["postgres"].startswith("error")
 
@@ -94,6 +94,6 @@ async def test_ready_reports_degraded_when_rabbitmq_unavailable(client):
     response = await client.get("/api/v1/ready")
 
     body = response.json()
-    assert response.status_code == 200
+    assert response.status_code == 503
     assert body["status"] == "degraded"
     assert body["rabbitmq"].startswith("error")

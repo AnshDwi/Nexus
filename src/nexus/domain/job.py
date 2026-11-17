@@ -196,7 +196,13 @@ class Job:
         )
         if permanent or self.attempt >= self.max_attempts:
             reason = "permanent error" if permanent else f"attempts exhausted ({self.attempt})"
-            return replace(failed, dead_lettered_at=now, last_error=f"{error} [{reason}]"), [t1]
+            final = replace(
+                failed,
+                dead_lettered_at=now,
+                next_attempt_at=None,  # no further automatic attempt
+                last_error=f"{error} [{reason}]",
+            )
+            return final, [t1]
         backoff = retry_backoff(
             self.attempt,
             initial_backoff_seconds=self.initial_backoff_seconds,

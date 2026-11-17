@@ -84,9 +84,11 @@ def test_retrying_returns_to_queued():
 
 
 def test_exhausted_attempts_stay_failed_and_dead_lettered():
-    failed, transitions = _job(JobState.RUNNING, attempt=3).fail(error="boom", now=NOW)
+    job = _job(JobState.RUNNING, attempt=3, next_attempt_at=NOW)  # left over from a retry
+    failed, transitions = job.fail(error="boom", now=NOW)
     assert failed.state is JobState.FAILED
     assert failed.dead_lettered_at == NOW
+    assert failed.next_attempt_at is None
     assert len(transitions) == 1
     assert "attempts exhausted" in (failed.last_error or "")
 

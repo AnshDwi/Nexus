@@ -10,3 +10,6 @@ docker-compose.yml
 .env
 .env.*
 !.env.example
+
+# Dashboard (separate Vercel project)
+frontend

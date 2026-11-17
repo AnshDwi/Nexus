@@ -44,35 +44,31 @@ def _verify(base_url: str, api_key: str, timeout: float, bypass_secret: str | No
         check("readiness", client.get(f"{base}/ready", headers=headers), 200)
         check("auth enforced", client.get(f"{base}/tasks"), 401)
         created = check(
-            "submit echo task",
+            "submit echo job",
             client.post(
-                f"{base}/tasks",
-                headers=headers,
-                json={
-                    "task_type": "echo",
-                    "payload": {"verify": time.time()},
-                    "retry_policy": {
-                        "max_attempts": 3,
-                        "initial_backoff_seconds": 1,
-                        "max_backoff_seconds": 5,
-                    },
-                },
+                f"{base}/jobs",
+                headers={**headers, "Idempotency-Key": f"verify-{time.time_ns()}"},
+                json={"name": "deployment-verification", "job_type": "echo", "payload": {}},
             ),
             201,
         )
-        task_id = created["task"]["task_id"]
+        job_id = created["job_id"]
         deadline = time.monotonic() + timeout
-        state = created["task"]["state"]
+        state = created["state"]
+        seen = [state]
         while time.monotonic() < deadline:
-            task = client.get(f"{base}/tasks/{task_id}", headers=headers).json()
-            state = task["state"]
-            if state == "succeeded":
-                print(f"[ok] task {task_id} executed on attempt {task['attempt']}")
+            job = client.get(f"{base}/jobs/{job_id}", headers=headers).json()["job"]
+            state = job["state"]
+            if state != seen[-1]:
+                seen.append(state)
+            if state == "completed":
+                print(f"[ok] job {job_id}: {' -> '.join(seen)}")
                 return 0
-            if state in {"permanently_failed", "cancelled", "rejected"}:
+            if state in {"failed", "cancelled"}:
                 break
             time.sleep(2)
-        print(f"[FAIL] task {task_id} ended in state '{state}'")
+        hint = " (is a worker connected to the broker?)" if state == "queued" else ""
+        print(f"[FAIL] job {job_id} ended in state '{state}'{hint}")
         return 1
 
 

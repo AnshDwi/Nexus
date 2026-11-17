@@ -46,6 +46,17 @@ def test_discrete_fields_are_url_encoded():
     assert "p%40ss%2Fword%3A1@" in settings.database_url
 
 
+def test_production_rejects_default_broker_credentials(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@db.example.com/db")
+    with pytest.raises(ValidationError, match="RabbitMQ credentials"):
+        _settings(environment="production", api_keys=_KEY)
+
+
+def test_rabbitmq_url_override_wins(monkeypatch):
+    monkeypatch.setenv("RABBITMQ_URL", "amqps://u:p@broker.example.com/vhost")
+    assert _settings().rabbitmq_url == "amqps://u:p@broker.example.com/vhost"
+
+
 def test_production_rejects_default_credentials_and_missing_api_keys():
     with pytest.raises(ValidationError, match="built-in defaults"):
         _settings(environment="production", api_keys=_KEY)
@@ -55,16 +66,19 @@ def test_production_rejects_default_credentials_and_missing_api_keys():
 
 def test_production_accepts_explicit_configuration(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@db.example.com/db")
+    monkeypatch.setenv("RABBITMQ_URL", "amqps://u:p@broker.example.com/vhost")
     settings = _settings(environment="production", api_keys=_KEY)
     assert settings.environment == "production"
 
 
-def test_vercel_env_selects_environment_and_vercel_queues(monkeypatch):
+def test_vercel_env_selects_environment_and_keeps_rabbitmq(monkeypatch):
+    # RabbitMQ stays the bus on Vercel unless Vercel Queues is chosen explicitly.
     monkeypatch.setenv("VERCEL_ENV", "preview")
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@db.example.com/db")
+    monkeypatch.setenv("RABBITMQ_PASSWORD", "strong")
     settings = _settings(api_keys=_KEY)
     assert settings.environment == "preview"
-    assert settings.event_bus is EventBus.VERCEL_QUEUES
+    assert settings.event_bus is EventBus.RABBITMQ
 
 
 def test_explicit_event_bus_is_respected_on_vercel(monkeypatch):
@@ -84,6 +98,7 @@ def test_daemon_only_publishes_when_it_can_name_the_push_partition(monkeypatch):
 
     monkeypatch.setenv("VERCEL_ENV", "production")
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@db.example.com/db")
+    monkeypatch.setenv("EVENT_BUS", "vercel_queues")
     assert can_publish_to_push_consumers(_settings(api_keys=_KEY)) is False
 
     monkeypatch.setenv("VERCEL_DEPLOYMENT_ID", "dpl_123")
@@ -92,3 +107,7 @@ def test_daemon_only_publishes_when_it_can_name_the_push_partition(monkeypatch):
     monkeypatch.delenv("VERCEL_DEPLOYMENT_ID")
     explicit = _settings(api_keys=_KEY, vercel_queue_deployment="all")
     assert can_publish_to_push_consumers(explicit) is True
+
+    monkeypatch.setenv("EVENT_BUS", "rabbitmq")
+    monkeypatch.setenv("RABBITMQ_URL", "amqps://u:p@broker.example.com/vhost")
+    assert can_publish_to_push_consumers(_settings(api_keys=_KEY)) is True

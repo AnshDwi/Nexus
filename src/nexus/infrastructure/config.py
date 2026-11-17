@@ -92,11 +92,16 @@ class Settings(BaseSettings):
     rabbitmq_port: int = 5672
     rabbitmq_user: str = "nexus"
     rabbitmq_password: SecretStr = SecretStr(_DEFAULT_PASSWORD)
+    # A managed broker URL (e.g. CloudAMQP: amqps://user:pass@host/vhost)
+    # wins over the discrete fields.
+    rabbitmq_url_override: SecretStr | None = Field(default=None, alias="RABBITMQ_URL")
+    rabbitmq_publish_timeout_seconds: float = 10.0
     # Vercel Queues: messages can only be received from the region they were
     # sent to, so pin one region for send and receive (defaults to
     # VERCEL_REGION inside the SDK when unset).
     vercel_queue_region: str | None = None
     vercel_queue_dispatch_topic: str = "nexus-task-dispatch"
+    vercel_queue_job_topic: str = "nexus-job-dispatch"
     vercel_queue_events_topic: str = "nexus-events"
     vercel_queue_publish_timeout_seconds: float = 10.0
     # Vercel Queues partitions topics by deployment. "auto": the current
@@ -123,6 +128,16 @@ class Settings(BaseSettings):
     # is re-dispatched (the claim guard makes duplicates harmless).
     reconciler_redispatch_after_seconds: float = 300.0
     daemon_tick_interval_seconds: float = 5.0
+    # Jobs
+    worker_heartbeat_ttl_seconds: float = 30.0
+    worker_heartbeat_interval_seconds: float = 5.0
+    worker_forget_after_ttls: int = 20
+    worker_capacity: int = 4
+    worker_shutdown_grace_seconds: float = 25.0
+    job_redispatch_after_seconds: float = 900.0
+    job_default_timeout_seconds: int = 60
+    job_max_timeout_seconds: int = 3600
+    job_default_max_attempts: int = 3
     daemon_health_port: int = 8081
 
     # --- Task execution -----------------------------------------------------
@@ -142,15 +157,17 @@ class Settings(BaseSettings):
     # Vercel Cron sends `Authorization: Bearer $CRON_SECRET`.
     cron_secret: SecretStr | None = Field(default=None, alias="CRON_SECRET")
     metrics_token: SecretStr | None = None
+    # Browser origins allowed to call the API (the dashboard), comma-separated.
+    # Empty = same-origin only. "*" is rejected outside local/test.
+    cors_allowed_origins: str = ""
+    rate_limit_reads_per_minute: int = 600
+    rate_limit_writes_per_minute: int = 120
     vercel_env: str | None = Field(default=None, alias="VERCEL_ENV")
 
     @model_validator(mode="after")
     def _resolve_environment(self) -> Self:
         if self.environment == "local" and self.vercel_env:
             self.environment = self.vercel_env
-        if self.vercel_env and "event_bus" not in self.model_fields_set:
-            # On Vercel there is no RabbitMQ; Vercel Queues is the bus.
-            self.event_bus = EventBus.VERCEL_QUEUES
         return self
 
     @model_validator(mode="after")
@@ -164,8 +181,19 @@ class Settings(BaseSettings):
             problems.append("database credentials are the built-in defaults")
         if not self.api_keys.get_secret_value():
             problems.append("API_KEYS is empty")
+        if (
+            self.event_bus is EventBus.RABBITMQ
+            and self.rabbitmq_url_override is None
+            and self.rabbitmq_password.get_secret_value() == _DEFAULT_PASSWORD
+        ):
+            problems.append("RabbitMQ credentials are the built-in defaults (set RABBITMQ_URL)")
         if self.debug:
             problems.append("DEBUG must be false")
+        if "*" in self.cors_origin_list:
+            problems.append("CORS_ALLOWED_ORIGINS must list explicit origins, not '*'")
+        for origin in self.cors_origin_list:
+            if not origin.startswith("https://"):
+                problems.append(f"CORS origin '{origin}' must use https")
         if problems:
             raise ValueError(
                 f"Refusing to start in environment '{self.environment}': " + "; ".join(problems)
@@ -235,6 +263,8 @@ class Settings(BaseSettings):
 
     @property
     def rabbitmq_url(self) -> str:
+        if self.rabbitmq_url_override is not None:
+            return self.rabbitmq_url_override.get_secret_value()
         return URL.create(
             "amqp",
             username=self.rabbitmq_user,
@@ -243,6 +273,10 @@ class Settings(BaseSettings):
             port=self.rabbitmq_port,
             database="",
         ).render_as_string(hide_password=False)
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [o.strip().rstrip("/") for o in self.cors_allowed_origins.split(",") if o.strip()]
 
     @property
     def webhook_allowed_host_set(self) -> frozenset[str]:

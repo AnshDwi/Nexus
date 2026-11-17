@@ -8,7 +8,10 @@ scheduler  Every DAEMON_TICK_INTERVAL_SECONDS: acquire/renew the
            leader, run the reconciler and drain the outbox. Multiple
            instances are safe; one leads, the rest stand by.
 
-worker     Poll-mode Vercel Queues consumer that runs the same handler as the
+worker     With EVENT_BUS=rabbitmq (default): the RabbitMQ job worker
+           (registration, heartbeats, prefetch = WORKER_CAPACITY, DLQ,
+           graceful drain on SIGTERM). With EVENT_BUS=vercel_queues: a
+           poll-mode Vercel Queues consumer that runs the same handler as the
            push-mode subscriber. Use it *instead of* the push subscriber
            (remove [[tool.vercel.subscribers]]) for tasks that need longer
            than a Function's maxDuration: a consumer group is either push or
@@ -26,6 +29,7 @@ import logging
 import signal
 import sys
 import time
+from datetime import timedelta
 from uuid import uuid4
 
 from nexus.infrastructure.config import EventBus, Settings, get_settings
@@ -35,6 +39,7 @@ from nexus.infrastructure.messaging.factory import (
     create_event_publisher,
     create_vercel_queue_client,
 )
+from nexus.infrastructure.messaging.relay import relay_pending_events
 from nexus.infrastructure.observability.logging import configure_logging
 
 logger = logging.getLogger("nexus.daemon")
@@ -104,6 +109,24 @@ async def run_scheduler(settings: Settings, stop: asyncio.Event) -> None:
     heartbeat = Heartbeat(stall_after_seconds=max(settings.daemon_tick_interval_seconds * 6, 60))
     server = await serve_health(heartbeat, settings.daemon_health_port)
     logger.info("scheduler daemon started", extra={"replica_id": str(replica_id)})
+
+    async def relay_loop() -> None:
+        # Every instance relays (SKIP LOCKED makes that safe); this is what
+        # turns RETRYING jobs back into QUEUED soon after their backoff.
+        while not stop.is_set():
+            if relay:
+                try:
+                    await relay_pending_events(
+                        session_factory, publisher.publisher, settings, max_events=50
+                    )
+                except Exception:
+                    logger.exception("relay loop failed")
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    stop.wait(), timeout=settings.outbox_relay_poll_interval_seconds
+                )
+
+    relay_task = asyncio.create_task(relay_loop())
     try:
         while not stop.is_set():
             try:
@@ -123,13 +146,73 @@ async def run_scheduler(settings: Settings, stop: asyncio.Event) -> None:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), timeout=settings.daemon_tick_interval_seconds)
     finally:
+        relay_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await relay_task
         server.close()
         await publisher.close()
         await engine.dispose()
         logger.info("scheduler daemon stopped")
 
 
+async def run_rabbitmq_worker(settings: Settings, stop: asyncio.Event) -> None:
+    from nexus.infrastructure.execution.executor import TaskExecutor
+    from nexus.infrastructure.execution.handlers import build_registry
+    from nexus.infrastructure.execution.job_executor import JobExecutor
+    from nexus.infrastructure.messaging.rabbitmq import create_rabbitmq_connection
+    from nexus.infrastructure.messaging.rabbitmq_worker import RabbitMQJobWorker, WorkerConfig
+
+    engine = create_engine(settings.database_url, settings)
+    session_factory = create_session_factory(engine)
+    connection = await create_rabbitmq_connection(settings.rabbitmq_url)
+    publisher = await create_event_publisher(settings)
+    handlers = build_registry(
+        enable_test_handlers=settings.task_enable_test_handlers,
+        webhook_allowed_hosts=settings.webhook_allowed_host_set,
+    )
+    worker = RabbitMQJobWorker(
+        connection=connection,
+        session_factory=session_factory,
+        executor=JobExecutor(
+            session_factory,
+            handlers,
+            worker_id=uuid4(),
+            lease_grace=timedelta(seconds=settings.task_lease_grace_seconds),
+        ),
+        task_executor=TaskExecutor(session_factory, handlers, publisher.publisher, settings),
+        config=WorkerConfig(
+            capacity=settings.worker_capacity,
+            heartbeat_interval=settings.worker_heartbeat_interval_seconds,
+            shutdown_grace=settings.worker_shutdown_grace_seconds,
+        ),
+    )
+    heartbeat = Heartbeat(stall_after_seconds=settings.worker_heartbeat_ttl_seconds)
+    server = await serve_health(heartbeat, settings.daemon_health_port)
+    await worker.start()
+    try:
+        while not stop.is_set():
+            if worker.healthy:
+                heartbeat.beat()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    stop.wait(), timeout=settings.worker_heartbeat_interval_seconds
+                )
+    finally:
+        await worker.stop()
+        server.close()
+        await connection.close()
+        await publisher.close()
+        await engine.dispose()
+
+
 async def run_worker(settings: Settings, stop: asyncio.Event) -> None:
+    if settings.event_bus is EventBus.RABBITMQ:
+        await run_rabbitmq_worker(settings, stop)
+        return
+    await run_poll_worker(settings, stop)
+
+
+async def run_poll_worker(settings: Settings, stop: asyncio.Event) -> None:
     from nexus.entrypoints.queue_subscriber import execute_dispatched_task
     from nexus.entrypoints.runtime import get_worker_runtime, reset_worker_runtime
 

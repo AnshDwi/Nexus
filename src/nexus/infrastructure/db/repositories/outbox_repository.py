@@ -14,8 +14,21 @@ class PostgresOutboxWriter:
         self._session = session
 
     async def add(self, event: DomainEvent) -> None:
+        """An event carrying metadata["available_at"] (ISO timestamp) is
+        held back in the outbox: the relay will not claim it before then.
+        Jobs use this to schedule retry backoff on brokers without native
+        delayed delivery (RabbitMQ). Distinct from metadata["deliver_after"],
+        which asks the *transport* to delay delivery (Vercel Queues does)."""
+        extra: dict[str, Any] = {}
+        hold_until = event.metadata.get("available_at")
+        if hold_until:
+            available_at = datetime.fromisoformat(str(hold_until))
+            if available_at.tzinfo is None:
+                available_at = available_at.replace(tzinfo=UTC)
+            extra["available_at"] = available_at
         self._session.add(
             OutboxRecordModel(
+                **extra,
                 event_id=event.event_id,
                 aggregate_id=event.aggregate_id,
                 aggregate_type=event.aggregate_type,

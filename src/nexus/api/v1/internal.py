@@ -34,6 +34,9 @@ async def maintenance(
         "promoted": report.reconcile.promoted,
         "cancelled_blocked": report.reconcile.cancelled_blocked,
         "relayed": report.relayed,
+        "jobs_recovered": report.jobs.total,
+        "dead_workers": report.dead_workers,
+        "fenced_out": report.fenced_out,
     }
 
 

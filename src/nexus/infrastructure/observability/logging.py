@@ -10,6 +10,10 @@ from datetime import UTC, datetime
 from typing import Any
 
 request_id_var: ContextVar[str | None] = ContextVar("nexus_request_id", default=None)
+# End-to-end correlation ID: taken from the client's X-Correlation-ID (or the
+# request ID), stored on the job, carried in the AMQP message and restored by
+# the worker, so one ID ties together API, relay and worker log lines.
+correlation_id_var: ContextVar[str | None] = ContextVar("nexus_correlation_id", default=None)
 
 _RESERVED = frozenset(vars(logging.makeLogRecord({})).keys()) | {"message", "asctime"}
 
@@ -25,6 +29,9 @@ class JsonFormatter(logging.Formatter):
         request_id = request_id_var.get()
         if request_id:
             entry["request_id"] = request_id
+        correlation_id = correlation_id_var.get()
+        if correlation_id:
+            entry["correlation_id"] = correlation_id
         for key, value in vars(record).items():
             if key not in _RESERVED and not key.startswith("_"):
                 entry[key] = value

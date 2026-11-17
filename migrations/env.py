@@ -9,6 +9,7 @@ from nexus.infrastructure.config import get_settings
 from nexus.infrastructure.db.base import Base
 from nexus.infrastructure.db.models import (  # noqa: F401
     inbox,
+    job,
     leader_lease,
     outbox,
     task,

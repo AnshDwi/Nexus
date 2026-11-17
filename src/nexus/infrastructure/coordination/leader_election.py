@@ -72,6 +72,31 @@ class PostgresLeaderElection:
         finally:
             scheduler_lease_acquisition_latency_seconds.observe(time.perf_counter() - start)
 
+    async def holds_lease(self, fencing_token: int) -> bool:
+        """Fencing check for a leader about to write.
+
+        True only if this replica still holds the lease *with this exact
+        token* and it has not expired (database clock). The row is locked
+        FOR SHARE until the caller's transaction ends, so a competing
+        replica cannot take the lease over (which needs an UPDATE) while
+        the caller's writes are in flight: the writes either commit under a
+        valid lease or the caller aborts. A paused leader that wakes up with
+        an old token is therefore rejected here.
+        """
+        row = (
+            await self._session.execute(
+                select(LeaderLeaseModel.lease_name)
+                .where(
+                    LeaderLeaseModel.lease_name == self._lease_name,
+                    LeaderLeaseModel.holder_id == self._replica_id,
+                    LeaderLeaseModel.fencing_token == fencing_token,
+                    LeaderLeaseModel.expires_at > func.statement_timestamp(),
+                )
+                .with_for_update(read=True)
+            )
+        ).first()
+        return row is not None
+
     async def _was_leader_before(self, now: ColumnElement[datetime]) -> bool:
         row = (
             await self._session.execute(

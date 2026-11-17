@@ -69,6 +69,7 @@ async def create_event_publisher(settings: Settings) -> PublisherHandle:
                 client,
                 dispatch_topic=settings.vercel_queue_dispatch_topic,
                 events_topic=settings.vercel_queue_events_topic,
+                job_topic=settings.vercel_queue_job_topic,
             ),
             close=_noop,
         )
@@ -77,8 +78,16 @@ async def create_event_publisher(settings: Settings) -> PublisherHandle:
     from nexus.infrastructure.messaging.rabbitmq_publisher import RabbitMQEventPublisher
 
     connection = await create_rabbitmq_connection(settings.rabbitmq_url)
+    publisher = RabbitMQEventPublisher(
+        connection, publish_timeout_seconds=settings.rabbitmq_publish_timeout_seconds
+    )
+
+    async def _close() -> None:
+        await publisher.close()
+        await connection.close()
+
     return PublisherHandle(
-        publisher=RabbitMQEventPublisher(connection),
-        close=connection.close,
+        publisher=publisher,
+        close=_close,
         rabbitmq_connection=connection,
     )

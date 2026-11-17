@@ -129,3 +129,18 @@ outbox_relayed_total = Counter(
     "Outbox rows handled by a relay pass, by trigger (eager, sweep, daemon).",
     ["trigger"],
 )
+
+job_submissions_total = Counter(
+    "nexus_job_submissions_total", "Job submissions by outcome.", ["outcome"]
+)
+job_executions_total = Counter(
+    "nexus_job_executions_total",
+    "Job attempts executed by type and outcome.",
+    ["job_type", "outcome"],
+)
+job_recoveries_total = Counter(
+    "nexus_job_recoveries_total", "Jobs recovered by the scheduler, by kind.", ["kind"]
+)
+rate_limited_requests_total = Counter(
+    "nexus_rate_limited_requests_total", "Requests rejected by the rate limiter.", ["scope"]
+)

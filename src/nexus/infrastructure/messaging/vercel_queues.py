@@ -63,17 +63,21 @@ class VercelQueuesEventPublisher:
         *,
         dispatch_topic: str,
         events_topic: str,
+        job_topic: str = "nexus-job-dispatch",
     ) -> None:
         self._client = client
         self._dispatch_topic = dispatch_topic
         self._events_topic = events_topic
+        self._job_topic = job_topic
 
     async def publish(self, event: DomainEvent) -> None:
         now = datetime.now(UTC)
         delay = delivery_delay(event, now=now)
         retention = min(max(_MIN_RETENTION, delay + _RETENTION_HEADROOM), _MAX_RETENTION)
-        if is_dispatch_event(event):
-            topic = self._dispatch_topic
+        if is_dispatch_event(event) or (
+            event.aggregate_type == "job" and event.event_type == DISPATCH_EVENT_TYPE
+        ):
+            topic = self._dispatch_topic if is_dispatch_event(event) else self._job_topic
             payload: dict[str, Any] = {**event.payload, "event_id": str(event.event_id)}
         else:
             topic = self._events_topic

@@ -1,21 +1,16 @@
-# Local stack mirroring the Vercel topology:
-#   api        -> Vercel Function (FastAPI)
-#   queue      -> Vercel Queues (the official SDK's local devserver)
-#   scheduler  -> Vercel Daemon `scheduler` (reconciler + outbox relay)
-#   worker     -> poll-mode executor (on Vercel the push-mode subscriber
-#                 function does this; locally nothing pushes, so we poll)
-#   migrate    -> the CI "migrate" step
-# None of this is deployed by Vercel: on Vercel these are Functions, Queues,
-# Daemons and a Marketplace Postgres (see docs/vercel-deployment.md).
+# Local stack (`docker compose up --build`, then open http://localhost:5173):
+#   dashboard  -> React dashboard (Vite dev server, proxies /api to `api`)
+#   api        -> FastAPI           (on Vercel: Python Function)
+#   scheduler  -> leader-elected relay + recovery (on Vercel: Daemon)
+#   worker     -> RabbitMQ job worker            (on Vercel: Daemon)
+#   migrate    -> alembic upgrade head           (on Vercel: CI step)
+#   postgres / rabbitmq / redis -> managed services in production
+# Compose itself is never deployed to Vercel (see docs/vercel-deployment.md).
 x-nexus-env: &nexus-env
   POSTGRES_HOST: postgres
-  REDIS_HOST: redis
   RABBITMQ_HOST: rabbitmq
-  EVENT_BUS: vercel_queues
-  VERCEL_QUEUE_BASE_URL: http://queue:9100
-  VERCEL_QUEUE_TOKEN: local-token
-  VERCEL_QUEUE_REGION: iad1
-  VERCEL_QUEUE_DEPLOYMENT: all
+  REDIS_URL: redis://redis:6379/0
+  EVENT_BUS: rabbitmq
 
 services:
   migrate:
@@ -29,12 +24,6 @@ services:
       postgres:
         condition: service_healthy
 
-  queue:
-    build: .
-    command: ["python", "-m", "vercel.queue.devserver", "--host", "0.0.0.0", "--port", "9100"]
-    ports:
-      - "9100:9100"
-
   api:
     build: .
     ports:
@@ -46,8 +35,10 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
-      queue:
-        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
       interval: 10s
@@ -65,8 +56,10 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
-      queue:
-        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
       interval: 15s
@@ -83,8 +76,10 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
-      queue:
-        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
       interval: 15s
@@ -107,10 +102,24 @@ services:
       timeout: 5s
       retries: 10
 
-  # Optional: only used when REDIS_ENABLED=true / REDIS_URL is set.
+  dashboard:
+    image: node:22-alpine
+    working_dir: /app
+    command: ["sh", "-c", "npm ci && npm run dev -- --host 0.0.0.0"]
+    environment:
+      NEXUS_API_PROXY: http://api:8000
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - dashboard_node_modules:/app/node_modules
+    depends_on:
+      - api
+
+  # Rate limiting and shared counters (optional; the API degrades to
+  # in-process limits without it).
   redis:
     image: redis:7-alpine
-    profiles: ["redis"]
     ports:
       - "127.0.0.1:6379:6379"
     healthcheck:
@@ -119,11 +128,10 @@ services:
       timeout: 5s
       retries: 10
 
-  # Optional: the original AMQP adapter (EVENT_BUS=rabbitmq) and its
-  # integration test. Not used by the Vercel deployment.
+  # Messaging: job dispatch, work queues and the dead-letter queue.
+  # Management UI: http://localhost:15672 (nexus / nexus).
   rabbitmq:
     image: rabbitmq:3-management-alpine
-    profiles: ["rabbitmq"]
     environment:
       RABBITMQ_DEFAULT_USER: nexus
       RABBITMQ_DEFAULT_PASS: nexus
@@ -138,3 +146,4 @@ services:
 
 volumes:
   postgres_data:
+  dashboard_node_modules:

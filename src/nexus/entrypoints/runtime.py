@@ -4,11 +4,14 @@ is its own generated function, so the API's lifespan does not run there."""
 
 import asyncio
 from dataclasses import dataclass
+from datetime import timedelta
+from uuid import uuid4
 
 from nexus.infrastructure.config import Settings, get_settings
 from nexus.infrastructure.db.session import create_engine, create_session_factory
 from nexus.infrastructure.execution.executor import TaskExecutor
 from nexus.infrastructure.execution.handlers import build_registry
+from nexus.infrastructure.execution.job_executor import JobExecutor
 from nexus.infrastructure.messaging.factory import PublisherHandle, create_event_publisher
 from nexus.infrastructure.observability.logging import configure_logging
 
@@ -18,6 +21,7 @@ class WorkerRuntime:
     settings: Settings
     executor: TaskExecutor
     publisher: PublisherHandle
+    job_executor: JobExecutor | None = None
 
     async def aclose(self) -> None:
         await self.publisher.close()
@@ -32,18 +36,24 @@ async def build_worker_runtime(settings: Settings | None = None) -> WorkerRuntim
     settings = settings or get_settings()
     configure_logging("DEBUG" if settings.debug else "INFO")
     engine = create_engine(settings.database_url, settings)
+    session_factory = create_session_factory(engine)
     publisher = await create_event_publisher(settings)
-    executor = TaskExecutor(
-        create_session_factory(engine),
-        build_registry(
-            enable_test_handlers=settings.task_enable_test_handlers,
-            webhook_allowed_hosts=settings.webhook_allowed_host_set,
-        ),
-        publisher.publisher,
-        settings,
-        engine=engine,
+    handlers = build_registry(
+        enable_test_handlers=settings.task_enable_test_handlers,
+        webhook_allowed_hosts=settings.webhook_allowed_host_set,
     )
-    return WorkerRuntime(settings=settings, executor=executor, publisher=publisher)
+    executor = TaskExecutor(session_factory, handlers, publisher.publisher, settings, engine=engine)
+    job_executor = JobExecutor(
+        session_factory,
+        handlers,
+        # One identity per function instance; the attempt + worker_id fence
+        # still applies, the lease covers instance loss.
+        worker_id=uuid4(),
+        lease_grace=timedelta(seconds=settings.task_lease_grace_seconds),
+    )
+    return WorkerRuntime(
+        settings=settings, executor=executor, publisher=publisher, job_executor=job_executor
+    )
 
 
 async def get_worker_runtime() -> WorkerRuntime:

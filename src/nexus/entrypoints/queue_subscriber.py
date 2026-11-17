@@ -15,11 +15,13 @@ Acknowledgement semantics (Vercel Queues Python SDK):
 import logging
 import os
 from typing import Any
+from uuid import UUID
 
 from vercel.queue import Message, RetryAfter, subscribe
 
 from nexus.entrypoints.runtime import get_worker_runtime
 from nexus.infrastructure.execution.executor import DispatchMessage, RetryLater
+from nexus.infrastructure.execution.job_executor import Disposition, JobMessage
 
 logger = logging.getLogger("nexus.queue_subscriber")
 
@@ -46,3 +48,27 @@ async def execute_dispatched_task(message: Message[dict[str, Any]]) -> None:
         await runtime.executor.handle_dispatch(dispatch)
     except RetryLater as deferred:
         raise RetryAfter(max(1, int(deferred.delay.total_seconds()))) from None
+
+
+JOB_TOPIC = os.environ.get("VERCEL_QUEUE_JOB_TOPIC", "nexus-job-dispatch")
+
+
+@subscribe(topic=JOB_TOPIC, consumer_group="nexus-job-executor", retry_after=15)
+async def execute_dispatched_job(message: Message[dict[str, Any]]) -> None:
+    """Jobs over Vercel Queues (EVENT_BUS=vercel_queues). Vercel Queues has
+    no dead-letter queue: a final failure is recorded on the job (FAILED,
+    dead_lettered_at) and the message is acknowledged."""
+    try:
+        parsed = JobMessage(
+            job_id=UUID(str(message.payload["job_id"])),
+            attempt=int(message.payload["attempt"]),
+            message_id=str(message.payload.get("event_id") or message.message_id),
+        )
+    except (KeyError, TypeError, ValueError):
+        logger.error("discarding malformed job message")
+        return
+    runtime = await get_worker_runtime()
+    assert runtime.job_executor is not None
+    disposition = await runtime.job_executor.handle(parsed)
+    if disposition is Disposition.REQUEUE:
+        raise RuntimeError("job claim failed; redeliver")

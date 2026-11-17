@@ -1,5 +1,8 @@
 # Deploying NEXUS on Vercel
 
+> Updated for the job pipeline (ADR 0005): RabbitMQ is the default bus;
+> Vercel Queues remains an opt-in transport.
+
 This document covers:
 1. Vercel capabilities and limits relevant to NEXUS (researched November 2026).
 2. How each NEXUS component maps onto them.
@@ -28,26 +31,35 @@ The NEXUS changes are shaped around these three constraints.
 
 | NEXUS component | Runs on | Notes |
 |---|---|---|
-| FastAPI API (health, tasks, cron, metrics) | Vercel Function | Entrypoint `vercel_app.api:app` (path shim for `src/` layout) |
-| Task executor | Vercel Queues push consumer (private function, generated from `[[tool.vercel.subscribers]]`) | Topic `nexus-task-dispatch`, group `nexus-executor`, `retry_after=15s` |
-| Outbox relay | Inside the API/consumer invocations (eager), Cron sweep, optional Daemon | All concurrent-safe (SKIP LOCKED + queue idempotency key) |
-| Reconciler + leader lease | Cron sweep and/or `scheduler` Daemon | Lease `nexus-maintenance`, database clock, fencing token |
-| Long-running poll worker | Optional Daemon (`python -m nexus.daemon worker`) | Use *instead of* push mode, not alongside it |
-| PostgreSQL | Marketplace provider | Migrations run from CI before deploy |
-| RabbitMQ adapter | Not on Vercel | Kept for `EVENT_BUS=rabbitmq` self-hosting |
-| Redis | Optional Marketplace provider | `REDIS_URL` enables it; readiness only checks it when configured |
-| Worker registry (heartbeats) | Unused by the Vercel pipeline | Vercel scales consumers itself; kept for self-hosted workers |
+| **Dashboard** (React/Vite) | Vercel project #2, Root Directory `frontend/` | Static build. `frontend/vercel.json` adds the SPA fallback and security headers. Set `VITE_API_BASE_URL` to the API project URL |
+| **API** (FastAPI) | Vercel project #1, repo root | Python Function, entrypoint `vercel_app.api:app` (path shim for the `src/` layout). Set `CORS_ALLOWED_ORIGINS` to the dashboard origin |
+| **Scheduler** (relay loop, fenced recovery, dead-worker detection) | Vercel **Daemon** `scheduler` | `deploy/vercel.daemons.json`. Two instances; one leads via the PostgreSQL lease |
+| **Job workers** (RabbitMQ consumers) | Vercel **Daemon** `worker` | Same image, `python -m nexus.daemon worker`. Registration, heartbeats, DLQ, SIGTERM drain (grace 60 s) |
+| **RabbitMQ** | **External managed broker** (CloudAMQP, Amazon MQ, self-run) | Vercel does not host RabbitMQ. Daemons connect outbound over `amqps://` (`RABBITMQ_URL`). The API Function opens one connection per instance for confirmed publishes |
+| **PostgreSQL** | Marketplace (e.g. Neon) | `DATABASE_URL` (pooled) + `DATABASE_URL_UNPOOLED` (migrations) |
+| **Redis** | Marketplace (e.g. Upstash, TCP `rediss://`), optional | Shared rate-limit counters (`REDIS_URL`) |
+| **Cron** | Vercel Cron → `/api/v1/internal/maintenance` | Backstop scheduler pass (daily on Hobby, every minute on Pro) |
+| Vercel Queues adapter | Optional (`EVENT_BUS=vercel_queues`) | Push-mode consumers for tasks *and* jobs. An alternative transport, **not** the default; RabbitMQ is never replaced silently |
 
-### Request and task flow
+### What runs without Daemons
+
+Previews, Hobby without Daemons, or Daemons not yet enabled:
+- The API, the dashboard, persistence, dispatch (confirmed publish to
+  RabbitMQ) and the daily cron all work.
+- **Execution does not.** Nothing consumes `nexus.jobs` until a worker is
+  connected to the same RabbitMQ and Postgres. A worker on any container host
+  works, but it is not the documented primary path.
+
+Jobs simply wait in QUEUED; none are lost.
+
+### Request and job flow
 
 ```
-POST /api/v1/tasks ─► [tx] tasks + task_transitions + outbox(dispatch) ─► commit
-                     └► eager relay ─► Vercel Queues "nexus-task-dispatch" (idempotency key = event_id)
-                                            │ push
-                                            ▼
-            queue consumer function: claim (attempt-guarded) ─► handler (timeout) ─► [tx] record
-                                            └► eager relay of follow-ups (retry / dependents)
-Cron (and/or scheduler Daemon) ─► leader lease ─► reconcile ─► relay backlog
+Dashboard ─► POST /api/v1/jobs ─► [tx] jobs + job_transitions + outbox ─► commit
+                                 └► relay: lock job, publish (confirm) ─► [same tx] QUEUED
+RabbitMQ nexus.jobs ─► worker daemon: inbox + claim (RUNNING) ─► handler ─► [tx] COMPLETED |
+                       FAILED→RETRYING (+ delayed outbox dispatch) | FAILED (dead-lettered → nexus.dead-letter)
+Scheduler daemon (leader, fenced) ─► relay due retries · recover dead-worker / expired-lease jobs
 ```
 
 ## 3. Guarantees and how they were verified
@@ -82,50 +94,44 @@ Cron (and/or scheduler Daemon) ─► leader lease ─► reconcile ─► relay
 
 ## 4. Setup
 
-1. **Create the project.** Import the repo in Vercel. `vercel.json` pins
-   `"framework": "fastapi"`. Pin the Functions region to match your database.
-2. **Add Postgres.** Install Neon (or another provider) from the Marketplace
-   and connect it to Production (and Preview, if previews should work). This
-   injects `DATABASE_URL` and `DATABASE_URL_UNPOOLED`. A `-pooler` host is
-   auto-detected and the asyncpg statement cache is disabled for PgBouncer.
-3. **Enable Queues** for the team. Push consumers authenticate with OIDC
-   automatically.
-4. **Set environment variables.** Mark secrets as Sensitive.
+1. **Provision managed services:**
+   - Postgres: Neon from the Vercel Marketplace.
+   - Redis (optional): Upstash from the Marketplace.
+   - A RabbitMQ broker reachable over TLS, e.g. CloudAMQP. Copy its `amqps://` URL.
+2. **API project** (repo root; `vercel.json` pins `"framework": "fastapi"`).
+   Set these environment variables, marking secrets as Sensitive:
 
    | Variable | Value |
    |---|---|
-   | `API_KEYS` | `tenant:sha256,...` (`uv run python -m nexus.cli new-api-key <tenant>`) |
-   | `CRON_SECRET` | random, ≥ 32 characters |
+   | `RABBITMQ_URL` | `amqps://…` |
+   | `API_KEYS` | `tenant:sha256,…` (`uv run python -m nexus.cli new-api-key <tenant>`) |
+   | `CRON_SECRET` | random value |
+   | `CORS_ALLOWED_ORIGINS` | `https://<dashboard>.vercel.app` |
+   | `REDIS_URL` | optional |
    | `METRICS_TOKEN` | optional |
-   | `VERCEL_QUEUE_REGION` | e.g. `iad1`, same as the function region |
-   | `WEBHOOK_ALLOWED_HOSTS` | optional; enables the `http.webhook` task type |
-   | `TASK_ENABLE_TEST_HANDLERS` | `false` in production |
+   | `WEBHOOK_ALLOWED_HOSTS` | optional |
 
-   The app refuses to start outside local/test if credentials are defaults,
-   `API_KEYS` is empty, or `DEBUG` is on.
-5. **Migrate before deploy.** CI runs `alembic upgrade head` against
-   `DATABASE_URL_UNPOOLED`, then `vercel build --prod` and
-   `vercel deploy --prebuilt --prod`, then
-   `python -m nexus.cli verify-deployment <url>`. Migrations must stay
-   backward compatible with the previous deployment: messages pinned to it
-   keep being consumed after a promote.
-6. **Choose a recovery cadence.**
-   - **Hobby:** the default daily cron, plus queue redelivery and eager relay.
-   - **Pro:** use `deploy/vercel.pro-cron.json` (every minute).
-   - **Seconds-level recovery:** use `deploy/vercel.daemons.json`. It runs two
-     `scheduler` daemon instances (beta, production only). Copy the file over
-     `vercel.json`. If `VERCEL_DEPLOYMENT_ID` is not present in daemon
-     instances, the daemon only reconciles and leaves publishing to the
-     Functions (it logs a warning).
+   `DATABASE_URL` and `DATABASE_URL_UNPOOLED` come from the Marketplace.
+   Keep `TASK_ENABLE_TEST_HANDLERS=false` in production.
+3. **Enable execution.** Copy `deploy/vercel.daemons.json` over `vercel.json`
+   (adds the `scheduler` and `worker` daemons) and deploy to production.
+   Daemons read the same environment variables. Scale with
+   `vercel daemons` or the dashboard.
+4. **Dashboard project.** Import the same repository again with Root Directory
+   `frontend`. Set `VITE_API_BASE_URL=https://<api-project>.vercel.app`. Users
+   enter their API key in the dashboard; it is stored only in their browser.
+5. **Migrate before deploying.** The CI job `deploy-production` runs
+   `alembic upgrade head` against `DATABASE_URL_UNPOOLED`, then
+   `vercel deploy --prebuilt --prod`, then `nexus.cli verify-deployment`.
+   Migrations must be backward compatible with the running version.
+6. **Verify:**
 
-### Preview deployments
+   ```
+   uv run python -m nexus.cli verify-deployment https://<api>.vercel.app --api-key <key>
+   ```
 
-Previews get Functions, Queues and the API, but **no daemons and no cron**.
-Eager relay and queue redelivery still execute tasks. Repairs only happen when
-`/api/v1/internal/maintenance` is called manually.
-
-Use a per-preview Neon branch, or a separate database. If you do, run
-migrations from `[tool.vercel.scripts] build` for previews only.
+   This checks health, readiness and auth, then submits a task and waits for
+   it to execute. Then open the dashboard and submit a job.
 
 ## 5. Operations
 

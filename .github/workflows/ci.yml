@@ -168,9 +168,50 @@ jobs:
   # DATABASE_URL_UNPOOLED (production, direct connection), NEXUS_VERIFY_API_KEY
   # (a key whose hash is in production API_KEYS), and optionally
   # VERCEL_AUTOMATION_BYPASS_SECRET if Deployment Protection is on.
+  compose-e2e:
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Validate compose file
+        run: docker compose config --quiet
+
+      - name: Build and start the full stack from scratch
+        run: docker compose up --build -d --wait --wait-timeout 300
+
+      - name: End-to-end tests against the containers
+        run: uv run pytest -m e2e -v
+
+      - name: Demo scenario (seeds and verifies outcomes)
+        run: docker compose --profile demo run --rm seed
+
+      - name: Graceful shutdown
+        run: |
+          docker compose stop api scheduler worker worker-small
+          docker compose ps -a --format '{{.Service}} {{.ExitCode}}' | tee /tmp/exit
+          ! grep -E '^(api|scheduler|worker|worker-small) [^0]' /tmp/exit
+
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail 200
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
   deploy-production:
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-    needs: [test, integration, vercel-build, frontend]
+    needs: [test, integration, vercel-build, frontend, compose-e2e]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production

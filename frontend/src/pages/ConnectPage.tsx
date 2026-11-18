@@ -1,4 +1,4 @@
-import { ConnectionForm } from './SettingsPage'
+import { ConnectionForm } from '../components/ConnectionForm'
 
 export function ConnectPage() {
   return (

@@ -13,3 +13,6 @@ htmlcov/
 # Vercel
 .vercel/
 _vc_queue_handlers/
+
+# Logs
+*.log

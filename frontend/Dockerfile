@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # NEXUS dashboard for local / self-hosted use: a production build served by
 # `vite preview`, which proxies /api to NEXUS_API_PROXY (the API service), so
 # the browser talks to one origin and no CORS setup is needed.

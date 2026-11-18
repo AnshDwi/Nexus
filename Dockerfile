@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # NEXUS application image: API, scheduler, worker and migrations all run
 # from this image with different commands (see docker-compose.yml). The same
 # file is the build for the Vercel Daemons (deploy/vercel.daemons.json).

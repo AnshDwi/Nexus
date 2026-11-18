@@ -9,7 +9,10 @@ ENV NPM_CONFIG_UPDATE_NOTIFIER=false NPM_CONFIG_FUND=false NPM_CONFIG_AUDIT=fals
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY . .
-RUN npm run build
+RUN npm run build \
+ # Vite compiles vite.config.ts into node_modules/.vite-temp at startup:
+ # that directory must be writable by the unprivileged runtime user.
+ && mkdir -p node_modules/.vite-temp && chown -R 1000:1000 node_modules/.vite-temp
 ENV NEXUS_API_PROXY=http://api:8000
 USER 1000:1000
 EXPOSE 5173

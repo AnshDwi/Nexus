@@ -119,6 +119,7 @@ async def stack(monkeypatch) -> AsyncIterator[Stack]:
     monkeypatch.setenv("API_KEYS", f"acme:{hash_api_key(KEY_A)},globex:{hash_api_key(KEY_B)}")
     monkeypatch.setenv("CRON_SECRET", CRON)
     monkeypatch.setenv("EVENT_BUS", "rabbitmq")
+    monkeypatch.setenv("REDIS_URL", "")  # in-process limiter unless a test opts in
     monkeypatch.setenv("TASK_ENABLE_TEST_HANDLERS", "true")
     monkeypatch.setenv("TASK_LEASE_GRACE_SECONDS", "1")
     monkeypatch.setenv("WORKER_HEARTBEAT_TTL_SECONDS", "2")

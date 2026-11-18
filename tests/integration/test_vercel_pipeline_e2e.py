@@ -125,6 +125,7 @@ async def nexus(monkeypatch, task_session_factory) -> AsyncIterator[Harness]:
     monkeypatch.setenv("CRON_SECRET", CRON)
     monkeypatch.setenv("TASK_ENABLE_TEST_HANDLERS", "true")
     monkeypatch.setenv("TASK_LEASE_GRACE_SECONDS", "0")
+    monkeypatch.setenv("REDIS_URL", "")  # independent of a developer .env
     monkeypatch.setenv("EVENT_BUS", "none")  # replaced by the embedded-queue publisher below
     get_settings.cache_clear()
     settings = get_settings()

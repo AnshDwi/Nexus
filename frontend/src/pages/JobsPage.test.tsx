@@ -26,6 +26,23 @@ describe('<JobsPage>', () => {
     expect(last.searchParams.getAll('status')).toEqual(['failed'])
   })
 
+  it('filters dead-lettered jobs and marks them in the table', async () => {
+    db.jobs = [
+      makeJob({ name: 'exhausted', state: 'failed', dead_lettered_at: new Date().toISOString() }),
+      makeJob({ name: 'fine', state: 'completed' }),
+    ]
+    const user = userEvent.setup()
+    renderWithApp(<JobsPage />, { route: '/jobs' })
+    expect(await screen.findByText('fine')).toBeInTheDocument()
+    expect(screen.getByText('dead-lettered')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Dead-lettered' }))
+    await waitFor(() => expect(screen.queryByText('fine')).not.toBeInTheDocument())
+    expect(screen.getByText('exhausted')).toBeInTheDocument()
+    const last = new URL(db.requests.filter((r) => r.url.includes('/jobs?')).at(-1)!.url)
+    expect(last.searchParams.get('dead_lettered')).toBe('true')
+  })
+
   it('cancels an eligible job and retries a failed one', async () => {
     db.jobs = [makeJob({ name: 'waiting', state: 'queued' }), makeJob({ name: 'broken', state: 'failed' })]
     const user = userEvent.setup()

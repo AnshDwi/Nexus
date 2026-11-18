@@ -120,6 +120,7 @@ export interface QueueSnapshot {
   queued: number
   retrying: number
   depth: number
+  dead_lettered_jobs: number
   broker: BrokerDepth
   unpublished_events: number
   items: QueueItem[]
@@ -131,6 +132,7 @@ export interface Summary {
   running: number
   completed: number
   failed: number
+  dead_lettered: number
   queue_depth: number
   broker: BrokerDepth
   workers: {
@@ -179,6 +181,7 @@ export interface JobFilters {
   status: JobState[]
   priority: JobPriority[]
   q: string
+  deadLettered?: boolean
   page: number
   pageSize: number
 }

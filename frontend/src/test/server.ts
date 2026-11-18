@@ -30,6 +30,7 @@ export const handlers = [
       queued: 1,
       retrying: 0,
       depth: 2,
+      dead_lettered_jobs: db.jobs.filter((j) => j.dead_lettered_at).length,
       broker: summary.broker,
       unpublished_events: 0,
       items: db.jobs
@@ -45,8 +46,12 @@ export const handlers = [
     const url = new URL(request.url)
     const statuses = url.searchParams.getAll('status')
     const q = url.searchParams.get('q') ?? ''
+    const deadOnly = url.searchParams.get('dead_lettered') === 'true'
     const items = db.jobs.filter(
-      (j) => (statuses.length === 0 || statuses.includes(j.state)) && (!q || j.name.includes(q)),
+      (j) =>
+        (statuses.length === 0 || statuses.includes(j.state)) &&
+        (!q || j.name.includes(q)) &&
+        (!deadOnly || j.dead_lettered_at !== null),
     )
     return HttpResponse.json({ items, total: items.length, page: 1, page_size: 20, pages: 1 })
   }),

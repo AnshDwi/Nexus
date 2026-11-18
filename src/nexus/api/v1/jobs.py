@@ -290,6 +290,7 @@ async def list_jobs(
     status_: Annotated[list[JobState] | None, Query(alias="status")] = None,
     priority: Annotated[list[JobPriority] | None, Query()] = None,
     q: Annotated[str | None, Query(max_length=200)] = None,
+    dead_lettered: Annotated[bool | None, Query()] = None,
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(ge=1, le=100)] = 25,
 ) -> JobPageOut:
@@ -299,6 +300,7 @@ async def list_jobs(
             states=frozenset(status_ or ()),
             priorities=frozenset(priority or ()),
             search=q or None,
+            dead_lettered=dead_lettered,
             page=page,
             page_size=page_size,
         )

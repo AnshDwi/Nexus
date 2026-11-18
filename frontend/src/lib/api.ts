@@ -124,6 +124,7 @@ export class NexusClient {
     filters.status.forEach((s) => query.append('status', s))
     filters.priority.forEach((p) => query.append('priority', p))
     if (filters.q.trim()) query.set('q', filters.q.trim())
+    if (filters.deadLettered) query.set('dead_lettered', 'true')
     return this.request<Paged<Job>>('GET', '/jobs', { query })
   }
   getJob(jobId: string) {

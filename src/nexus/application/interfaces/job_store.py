@@ -13,6 +13,7 @@ class JobQuery:
     states: frozenset[JobState] = frozenset()
     priorities: frozenset[JobPriority] = frozenset()
     search: str | None = None
+    dead_lettered: bool | None = None
     page: int = 1
     page_size: int = 25
 
@@ -107,6 +108,8 @@ class JobStore(Protocol):
 
     # --- read models (dashboard) --------------------------------------------
     async def counts_by_state(self, tenant_id: str) -> dict[JobState, int]: ...
+
+    async def count_dead_lettered(self, tenant_id: str) -> int: ...
 
     async def running_by_worker(self) -> dict[UUID, int]: ...
 

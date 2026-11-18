@@ -9,3 +9,8 @@ tests
 docs
 .env
 .env.*
+frontend
+deploy
+vercel_app
+node_modules
+**/__pycache__

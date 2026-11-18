@@ -138,6 +138,7 @@ class QueueOut(BaseModel):
     queued: int
     retrying: int
     depth: int
+    dead_lettered_jobs: int
     broker: BrokerDepth
     unpublished_events: int
     items: list[QueueItemOut]
@@ -188,6 +189,7 @@ async def queue(
         queued=queued,
         retrying=retrying,
         depth=pending + queued + retrying,
+        dead_lettered_jobs=await store.count_dead_lettered(principal.tenant_id),
         broker=await _broker_depth(rabbit),
         unpublished_events=unpublished,
         items=items,
@@ -260,6 +262,7 @@ class SummaryOut(BaseModel):
     running: int
     completed: int
     failed: int
+    dead_lettered: int
     queue_depth: int
     broker: BrokerDepth
     workers: WorkerHealthOut
@@ -303,6 +306,7 @@ async def summary(
         running=counts[JobState.RUNNING],
         completed=counts[JobState.COMPLETED],
         failed=counts[JobState.FAILED],
+        dead_lettered=await store.count_dead_lettered(principal.tenant_id),
         queue_depth=counts[JobState.PENDING] + counts[JobState.QUEUED] + counts[JobState.RETRYING],
         broker=await _broker_depth(rabbit),
         workers=WorkerHealthOut(

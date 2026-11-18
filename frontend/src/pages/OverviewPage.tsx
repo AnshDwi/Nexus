@@ -31,13 +31,19 @@ export function OverviewPage() {
         <StatCard label="Total jobs" value={data.total_jobs} icon={ListChecks} />
         <StatCard label="Running" value={data.running} icon={PlayCircle} tone="blue" />
         <StatCard label="Completed" value={data.completed} icon={CheckCircle2} tone="green" />
-        <StatCard label="Failed" value={data.failed} icon={AlertOctagon} tone="red" />
+        <StatCard
+          label="Failed"
+          value={data.failed}
+          icon={AlertOctagon}
+          tone="red"
+          hint={data.dead_lettered > 0 ? <Link to="/jobs?dead_lettered=1" className="text-accent-400 hover:underline">{data.dead_lettered} dead-lettered</Link> : undefined}
+        />
         <StatCard
           label="Queue depth"
           value={data.queue_depth}
           icon={Layers}
           tone="amber"
-          hint={data.broker.available ? `${data.broker.ready_messages ?? 0} in broker · ${data.broker.dead_letter_messages ?? 0} dead-lettered` : 'broker unavailable'}
+          hint={data.broker.available ? `${data.broker.ready_messages ?? 0} ready in RabbitMQ · ${data.broker.consumers ?? 0} consumers` : 'broker unavailable'}
         />
         <StatCard
           label="Worker health"

@@ -22,6 +22,7 @@ describe('pages', () => {
     expect(screen.getByTestId('stat-failed')).toHaveTextContent('4')
     expect(screen.getByTestId('stat-worker-health')).toHaveTextContent('2/2')
     expect(screen.getByText('nightly-report')).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: '2 dead-lettered' })).toHaveAttribute('href', '/jobs?dead_lettered=1')
   })
 
   it('Overview shows an error state with retry when the API fails', async () => {
@@ -42,6 +43,7 @@ describe('pages', () => {
     renderWithApp(<QueuePage />)
     expect(await screen.findByText('waiting')).toBeInTheDocument()
     expect(screen.getByText('Confirmed by broker')).toBeInTheDocument()
+    expect(screen.getByTestId('stat-dead-lettered')).toHaveTextContent('0')
   })
 
   it('Execution history shows failure reasons', async () => {

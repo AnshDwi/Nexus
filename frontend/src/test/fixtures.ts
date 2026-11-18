@@ -38,6 +38,7 @@ export const summary: Summary = {
   running: 3,
   completed: 30,
   failed: 4,
+  dead_lettered: 2,
   queue_depth: 4,
   broker: { available: true, ready_messages: 2, consumers: 1, dead_letter_messages: 1 },
   workers: { total: 2, healthy: 2, unhealthy: 0, draining: 0, capacity: 8, busy: 3 },

@@ -49,6 +49,7 @@ export function JobsPage() {
       status: params.getAll('status') as JobState[],
       priority: params.getAll('priority') as JobPriority[],
       q: params.get('q') ?? '',
+      deadLettered: params.get('dead_lettered') === '1',
       page: Number(params.get('page') ?? '1') || 1,
       pageSize: 20,
     }),
@@ -132,7 +133,20 @@ export function JobsPage() {
           {JOB_PRIORITIES.map((p) => (
             <Chip key={p} active={filters.priority.includes(p)} onClick={() => update('priority', toggle(filters.priority, p))}>{p}</Chip>
           ))}
-          {(filters.status.length > 0 || filters.priority.length > 0 || filters.q) && (
+          <span className="mx-1 h-4 w-px bg-ink-700" aria-hidden />
+          <Chip
+            active={Boolean(filters.deadLettered)}
+            onClick={() => {
+              const next = new URLSearchParams(params)
+              if (filters.deadLettered) next.delete('dead_lettered')
+              else next.set('dead_lettered', '1')
+              next.delete('page')
+              setParams(next)
+            }}
+          >
+            Dead-lettered
+          </Chip>
+          {(filters.status.length > 0 || filters.priority.length > 0 || filters.q || filters.deadLettered) && (
             <button type="button" className="btn-ghost ml-auto px-2 py-1 text-xs" onClick={() => { setSearch(''); setParams(new URLSearchParams()) }}>
               Clear filters
             </button>
@@ -147,7 +161,7 @@ export function JobsPage() {
           <ErrorState error={error} onRetry={() => void refetch()} />
         ) : !data || data.items.length === 0 ? (
           <EmptyState
-            title={filters.status.length || filters.priority.length || filters.q ? 'No jobs match these filters' : 'No jobs yet'}
+            title={filters.status.length || filters.priority.length || filters.q || filters.deadLettered ? 'No jobs match these filters' : 'No jobs yet'}
             description="Create a job to dispatch it to a worker."
           />
         ) : (
@@ -167,7 +181,16 @@ export function JobsPage() {
                         <div className="font-medium text-ink-100">{job.name}</div>
                         <div className="font-mono text-xs text-ink-400">{job.job_type} · {job.job_id.slice(0, 8)}</div>
                       </td>
-                      <td className="td"><StateBadge state={job.state} /></td>
+                      <td className="td">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <StateBadge state={job.state} />
+                          {job.dead_lettered_at && (
+                            <span className="rounded-full bg-fuchsia-500/10 px-2 py-0.5 text-[11px] font-medium text-fuchsia-300 ring-1 ring-inset ring-fuchsia-500/30">
+                              dead-lettered
+                            </span>
+                          )}
+                        </div>
+                      </td>
                       <td className="td"><PriorityBadge priority={job.priority} /></td>
                       <td className="td tabular-nums">{job.attempt}/{job.max_attempts}</td>
                       <td className="td text-ink-300">{formatRelative(job.created_at)}</td>

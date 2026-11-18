@@ -189,6 +189,10 @@ class PostgresJobStore:
             stmt = stmt.where(JobModel.state.in_([s.value for s in query.states]))
         if query.priorities:
             stmt = stmt.where(JobModel.priority.in_([p.value for p in query.priorities]))
+        if query.dead_lettered is True:
+            stmt = stmt.where(JobModel.dead_lettered_at.is_not(None))
+        elif query.dead_lettered is False:
+            stmt = stmt.where(JobModel.dead_lettered_at.is_(None))
         if query.search:
             pattern = f"%{query.search.strip()}%"
             stmt = stmt.where(
@@ -340,6 +344,16 @@ class PostgresJobStore:
         for state, count in rows.all():
             counts[JobState(state)] = count
         return counts
+
+    async def count_dead_lettered(self, tenant_id: str) -> int:
+        count: int = (
+            await self._session.execute(
+                select(func.count()).where(
+                    JobModel.tenant_id == tenant_id, JobModel.dead_lettered_at.is_not(None)
+                )
+            )
+        ).scalar_one()
+        return count
 
     async def running_by_worker(self) -> dict[UUID, int]:
         rows = await self._session.execute(

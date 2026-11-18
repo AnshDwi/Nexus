@@ -28,10 +28,21 @@ export function QueuePage() {
         <StatCard label="Retrying" value={data.retrying} icon={Clock} tone="amber" />
         <StatCard
           label="Dead-lettered"
-          value={data.broker.available ? data.broker.dead_letter_messages ?? 0 : '—'}
+          value={data.dead_lettered_jobs}
           icon={Skull}
           tone="red"
-          hint={data.broker.available ? `${data.broker.ready_messages ?? 0} ready · ${data.broker.consumers ?? 0} consumers` : 'broker not reachable from API'}
+          hint={
+            <>
+              {data.broker.available
+                ? `${data.broker.dead_letter_messages ?? 0} message(s) in nexus.dead-letter · ${data.broker.ready_messages ?? 0} ready · ${data.broker.consumers ?? 0} consumers`
+                : 'broker not reachable from API'}
+              {data.dead_lettered_jobs > 0 && (
+                <Link to="/jobs?dead_lettered=1" className="mt-1 block text-accent-400 hover:underline">
+                  View dead-lettered jobs →
+                </Link>
+              )}
+            </>
+          }
         />
       </div>
       <div className="card overflow-hidden">

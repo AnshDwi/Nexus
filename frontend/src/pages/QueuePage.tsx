@@ -34,7 +34,7 @@ export function QueuePage() {
           hint={
             <>
               {data.broker.available
-                ? `${data.broker.dead_letter_messages ?? 0} message(s) in nexus.dead-letter · ${data.broker.ready_messages ?? 0} ready · ${data.broker.consumers ?? 0} consumers`
+                ? `jobs currently dead-lettered · RabbitMQ nexus.dead-letter holds ${data.broker.dead_letter_messages ?? 0} message(s), incl. jobs since retried · ${data.broker.consumers ?? 0} consumers`
                 : 'broker not reachable from API'}
               {data.dead_lettered_jobs > 0 && (
                 <Link to="/jobs?dead_lettered=1" className="mt-1 block text-accent-400 hover:underline">

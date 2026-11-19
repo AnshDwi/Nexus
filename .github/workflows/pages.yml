@@ -1,0 +1,130 @@
+# Live demo on GitHub Pages: https://anshdwi.github.io/Nexus/
+#
+# Publishes ONLY the static dashboard, built in demo mode (an in-browser
+# simulator stands in for the API). The backend, scheduler, workers,
+# PostgreSQL, RabbitMQ and Redis are not deployed here.
+#
+# - Pull requests touching the dashboard: build and verify only (no deploy).
+# - Pushes to main (i.e. after a PR is approved and merged), or a manual run
+#   on main: build, verify, deploy, then smoke-test the public URL.
+# Requires Settings → Pages → Build and deployment → Source: "GitHub Actions".
+name: Pages demo
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - ".github/workflows/pages.yml"
+  pull_request:
+    paths:
+      - "frontend/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+# Least privilege by default; only the deploy job may write to Pages.
+permissions:
+  contents: read
+
+# One deployment at a time; never cancel a deployment that is in progress.
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Tests (normal build)
+        run: npm test
+
+      - name: Tests (demo build, served under /Nexus/)
+        run: npm run test:demo
+
+      # Demo code must never reach the normal (Docker / Vercel) build.
+      - name: Normal build contains no demo code
+        run: |
+          npm run build
+          if grep -rlE 'in-browser simulator|Demo mode' dist/assets; then
+            echo "::error::demo code found in the normal build"; exit 1
+          fi
+          echo "normal build is free of demo code"
+
+      # Builds with --mode pages (demo on, base /Nexus/), writes the 404.html
+      # SPA fallback and runs scripts/check-pages-build.mjs (asset paths,
+      # fallback, no secrets or local backend addresses).
+      - name: Build the Pages demo
+        run: npm run build:pages
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: frontend/dist
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Read Pages configuration
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Check the site path matches the build's base path
+        env:
+          BASE_PATH: ${{ steps.pages.outputs.base_path }}
+        run: |
+          if [ "$BASE_PATH" != "/Nexus" ]; then
+            echo "::error::Pages serves this site at '$BASE_PATH', but the demo is built for /Nexus/ (frontend/.env.pages)"
+            exit 1
+          fi
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Smoke-test the public URL
+        env:
+          URL: ${{ steps.deployment.outputs.page_url }}
+        run: |
+          for i in $(seq 1 20); do
+            if curl -fsS "$URL" -o index.html && grep -q '/Nexus/assets/' index.html; then break; fi
+            sleep 6
+          done
+          grep -q '/Nexus/assets/' index.html || { echo "::error::$URL did not serve the dashboard"; exit 1; }
+          origin=$(echo "$URL" | sed -E 's#^(https?://[^/]+).*#\1#')
+          asset=$(grep -o '/Nexus/assets/index-[^"]*\.js' index.html | head -1)
+          curl -fsS -o /dev/null "$origin$asset" || { echo "::error::$origin$asset not served"; exit 1; }
+          # Deep links are served by the 404.html SPA fallback.
+          curl -sS "${URL%/}/jobs" | grep -q '/Nexus/assets/' || { echo "::error::deep link fallback missing"; exit 1; }
+          echo "Live: $URL"

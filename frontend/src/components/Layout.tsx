@@ -1,6 +1,8 @@
 import clsx from 'clsx'
 import {
   Activity,
+  BookOpen,
+  FlaskConical,
   Gauge,
   History,
   Layers,
@@ -12,6 +14,7 @@ import {
 } from 'lucide-react'
 import { useState, type ReactNode } from 'react'
 import { NavLink } from 'react-router-dom'
+import { DemoBanner } from '../demo/DemoBanner'
 import { useReady, useSystem } from '../lib/queries'
 
 const NAV = [
@@ -21,16 +24,17 @@ const NAV = [
   { to: '/queue', label: 'Queue', icon: Layers },
   { to: '/executions', label: 'Execution History', icon: History },
   { to: '/settings', label: 'Settings', icon: SettingsIcon },
+  ...(__NEXUS_DEMO__ ? [{ to: '/about', label: 'About NEXUS', icon: BookOpen }] : []),
 ]
 
 function ConnectionIndicator() {
   const ready = useReady()
   const system = useSystem()
   const ok = ready.data?.status === 'ok' && !system.error
-  const label = ready.isLoading ? 'Connecting…' : ok ? 'API connected' : 'API degraded'
+  const label = ready.isLoading ? 'Connecting…' : __NEXUS_DEMO__ ? 'Simulated API' : ok ? 'API connected' : 'API degraded'
   return (
     <div className="flex items-center gap-2 text-xs text-ink-300" title={label}>
-      <span className={clsx('h-2 w-2 rounded-full', ready.isLoading ? 'bg-ink-400' : ok ? 'bg-emerald-400' : 'bg-rose-400')} aria-hidden />
+      <span className={clsx('h-2 w-2 rounded-full', ready.isLoading ? 'bg-ink-400' : __NEXUS_DEMO__ ? 'bg-amber-400' : ok ? 'bg-emerald-400' : 'bg-rose-400')} aria-hidden />
       <span className="hidden sm:inline">{label}</span>
       {system.data && (
         <span className="hidden rounded-md bg-ink-800 px-2 py-0.5 font-mono md:inline">
@@ -71,7 +75,11 @@ function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
         </NavLink>
       ))}
       <div className="mt-auto flex items-center gap-2 rounded-lg border border-ink-700 bg-ink-850 px-3 py-2 text-xs text-ink-400">
-        <Activity className="h-3.5 w-3.5" aria-hidden /> Live · refreshes every 3s
+        {__NEXUS_DEMO__ ? (
+          <><FlaskConical className="h-3.5 w-3.5" aria-hidden /> Demo · simulated in browser</>
+        ) : (
+          <><Activity className="h-3.5 w-3.5" aria-hidden /> Live · refreshes every 3s</>
+        )}
       </div>
     </nav>
   )
@@ -96,6 +104,7 @@ export function Layout({ children }: { children: ReactNode }) {
         </div>
       )}
       <div className="flex min-w-0 flex-1 flex-col">
+        {__NEXUS_DEMO__ && <DemoBanner />}
         <header className="flex h-14 items-center justify-between gap-3 border-b border-ink-700 bg-ink-900/80 px-4 backdrop-blur sm:px-6">
           <button type="button" className="btn-ghost p-1.5 lg:hidden" aria-label="Open menu" onClick={() => setOpen(true)}>
             <Menu className="h-5 w-5" />

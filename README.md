@@ -21,6 +21,59 @@ Dashboard (React) ──► API (FastAPI) ──► PostgreSQL ◄────�
                   relay retries · dead-worker detection · lease expiry
 ```
 
+## Live demo
+
+> **Status: not deployed yet.** The [Pages workflow](.github/workflows/pages.yml) publishes the demo to `https://anshdwi.github.io/Nexus/` once GitHub Pages is enabled (**Settings → Pages → Source: GitHub Actions**) and the change is merged into `main`. This line will link to the live site after the first verified deployment.
+
+The demo is the real dashboard built in **demo mode**. GitHub Pages can only serve static files, so it runs no API, broker, database or workers. The dashboard's API client talks to an in-browser simulator instead:
+- The simulator answers the same endpoints, seeded with 24 hours of history.
+- It moves jobs through the same state machine, retry backoff and dead-letter rules as the backend.
+- A banner on every page says the data is simulated.
+
+Everything else — real execution, RabbitMQ, persistence, monitoring — runs with `docker compose up --build`. See [docs/github-pages-demo.md](docs/github-pages-demo.md) for how the demo is built, deployed and isolated.
+
+| Overview | Dead-letter recovery |
+|---|---|
+| ![Overview: job totals, 24-hour execution trend, recent activity](docs/screenshots/demo-overview.png) | ![Dead-lettered jobs filtered by error, with retry all matching](docs/screenshots/demo-dead-letters.png) |
+| **Job detail: automatic retry with backoff** | **Worker fleet, including an unhealthy worker** |
+| ![Job timeline: failed attempt, retry in 2s, completed on attempt 2](docs/screenshots/demo-retry-timeline.png) | ![Workers with capacity, load and heartbeat age](docs/screenshots/demo-workers.png) |
+
+<sub>Screenshots are from the demo build, so the data is simulated.</sub>
+
+## Features
+
+- **Job API:** create (with idempotency keys), list, search, filter, cancel, retry, and bulk-retry, with tenant-scoped API keys and rate limiting.
+- **Reliable dispatch:** a transactional outbox plus RabbitMQ publisher confirms. A job is QUEUED only once the broker has the message.
+- **Worker fleet:**
+  - registration, heartbeats and capacity-aware consumption;
+  - timeouts;
+  - graceful drain on SIGTERM;
+  - dead-worker detection and recovery.
+- **Retries and dead letters:**
+  - exponential backoff;
+  - permanent-error handling;
+  - dead-lettering;
+  - single and bulk retry filtered by error;
+  - broker dead-letter pruning.
+- **Scheduler:** leader election with fencing tokens, so a stale replica can never write.
+- **Dashboard:** overview, jobs, workers, queue, execution history and settings, refreshed live.
+- **Monitoring:** Prometheus metrics computed from durable state, 11 alert rules, and a provisioned Grafana dashboard.
+- **Delivery:**
+  - a one-command Docker Compose stack;
+  - CI with unit, integration and end-to-end tests;
+  - Vercel deployment;
+  - the GitHub Pages demo.
+
+## Tech stack
+
+| Layer | Technology |
+|---|---|
+| Backend | Python 3.12, FastAPI, SQLAlchemy 2 (async), Alembic, Pydantic |
+| Messaging and storage | RabbitMQ (aio-pika), PostgreSQL, Redis |
+| Frontend | React 19, TypeScript, Vite, Tailwind CSS, TanStack Query, React Router, Recharts |
+| Testing | pytest, Vitest, Testing Library, MSW |
+| Operations | Docker Compose, Prometheus, Grafana, GitHub Actions, Vercel, GitHub Pages (demo) |
+
 ---
 
 ## Contents
@@ -33,7 +86,8 @@ Dashboard (React) ──► API (FastAPI) ──► PostgreSQL ◄────�
 6. [Monitoring](#monitoring)
 7. [Testing](#testing)
 8. [Deploying to Vercel](#deploying-to-vercel)
-9. [Known limitations](#known-limitations)
+9. [GitHub Pages demo](#github-pages-demo)
+10. [Known limitations](#known-limitations)
 
 ---
 
@@ -347,6 +401,8 @@ uv run alembic upgrade head && uv run pytest -m integration   # needs Postgres, 
 
 # Frontend
 cd frontend && npm ci && npm run typecheck && npm run lint && npm test && npm run build
+npm run test:demo      # demo simulator + the whole app as served under /Nexus/
+npm run build:pages    # GitHub Pages build, verified by scripts/check-pages-build.mjs
 
 # Migrations: upgrade, model/migration drift check, full downgrade
 uv run alembic upgrade head && uv run alembic check && uv run alembic downgrade base
@@ -404,6 +460,16 @@ See **[docs/vercel-deployment.md](docs/vercel-deployment.md)**. In short:
 
 ---
 
+## GitHub Pages demo
+
+`.github/workflows/pages.yml` builds the dashboard in demo mode and publishes it to GitHub Pages.
+- **Pull requests:** build and verify only.
+- **Pushes to `main`:** build, deploy, then smoke-test the public URL.
+
+It needs one setting: **Settings → Pages → Source: GitHub Actions**. Setup, the base-path configuration, the demo architecture, and what does and doesn't work without a backend are covered in [docs/github-pages-demo.md](docs/github-pages-demo.md).
+
+---
+
 ## Known limitations
 
 - **Vercel Daemons are in public beta** and run only on production deployments. Preview deployments have an API but no scheduler or workers. The `/internal/maintenance` cron relays the outbox, but cannot execute jobs.
@@ -414,4 +480,5 @@ See **[docs/vercel-deployment.md](docs/vercel-deployment.md)**. In short:
 - **Rate limiting without Redis is per process.** Set `REDIS_URL` for limits shared across instances.
 - **Tasks API retries over RabbitMQ.** The legacy `/tasks` DAG API retries through the scheduler's reconciler rather than outbox hold-back, so its retry delay is rounded up to the scheduler interval.
 - **Fixed job types.** Workers run only registered handlers (`echo`, `http.webhook`, test types). Arbitrary code is never accepted.
+- **The GitHub Pages demo is a simulation.** It has no backend, so no job really executes there, and its data lives in browser memory and resets on reload. Its job outcomes are decided by the simulator; it follows the backend's state machine, but it isn't a test of the backend.
 - **No per-user identity.** Authentication is API-key per tenant; there are no user accounts or roles.

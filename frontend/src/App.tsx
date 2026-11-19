@@ -16,6 +16,9 @@ const WorkersPage = lazy(() => import('./pages/WorkersPage').then((m) => ({ defa
 const QueuePage = lazy(() => import('./pages/QueuePage').then((m) => ({ default: m.QueuePage })))
 const ExecutionsPage = lazy(() => import('./pages/ExecutionsPage').then((m) => ({ default: m.ExecutionsPage })))
 const SettingsPage = lazy(() => import('./pages/SettingsPage').then((m) => ({ default: m.SettingsPage })))
+// Demo builds only. __NEXUS_DEMO__ is replaced by a literal at build time
+// (vite.config.ts), so other builds emit no About chunk and no simulator.
+const AboutPage = __NEXUS_DEMO__ ? lazy(() => import('./demo/AboutPage').then((m) => ({ default: m.AboutPage }))) : null
 
 
 export function AppRoutes() {
@@ -32,6 +35,7 @@ export function AppRoutes() {
         <Route path="/queue" element={<QueuePage />} />
         <Route path="/executions" element={<ExecutionsPage />} />
         <Route path="/settings" element={<SettingsPage />} />
+        {AboutPage && <Route path="/about" element={<AboutPage />} />}
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
       </Suspense>
@@ -53,7 +57,8 @@ export function Providers({ children, connection }: { children: ReactNode; conne
 export default function App() {
   return (
     <Providers>
-      <BrowserRouter>
+      {/* BASE_URL is "/" normally and "/Nexus/" in the GitHub Pages build. */}
+      <BrowserRouter basename={import.meta.env.BASE_URL.replace(/\/$/, '') || '/'}>
         <AppRoutes />
       </BrowserRouter>
     </Providers>

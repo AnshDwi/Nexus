@@ -141,6 +141,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      # The Vercel Python builder resolves dependencies with uv and fails
+      # when it is not on PATH.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
       - name: Install Vercel CLI
         run: npm install -g vercel@latest
       - name: Build with a local project stub

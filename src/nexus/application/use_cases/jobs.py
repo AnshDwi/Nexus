@@ -33,7 +33,9 @@ from nexus.domain.idempotency import IdempotencyKey
 from nexus.domain.job import (
     CANCELLABLE_JOB_STATES,
     DISPATCHABLE_JOB_STATES,
+    InvalidJobTransitionError,
     Job,
+    JobNotRetryableError,
     JobPriority,
     JobState,
 )
@@ -344,6 +346,30 @@ async def retry_job(store: JobStore, outbox: OutboxWriter, *, job_id: UUID, tena
     await store.append_transitions(job_id, [transition])
     await request_job_dispatch(outbox, retrying, now=now)
     return await store.save(retrying, dispatch_requested_at=now)
+
+
+@dataclass(frozen=True, slots=True)
+class BulkRetryOutcome:
+    retried: list[Job]
+    skipped: list[tuple[UUID, str, str]]  # (job_id, code, message)
+
+
+async def retry_jobs(
+    store: JobStore, outbox: OutboxWriter, *, job_ids: list[UUID], tenant_id: str
+) -> BulkRetryOutcome:
+    """Retry several final failures in one transaction. A job that cannot be
+    retried is reported and skipped; it does not undo the others. The checks
+    in `retry_job` run before any write, so a skipped job leaves no trace."""
+    retried: list[Job] = []
+    skipped: list[tuple[UUID, str, str]] = []
+    for job_id in dict.fromkeys(job_ids):  # de-duplicate, keep order
+        try:
+            retried.append(await retry_job(store, outbox, job_id=job_id, tenant_id=tenant_id))
+        except JobNotFoundError:
+            skipped.append((job_id, "not_found", "job not found"))
+        except (JobNotRetryableError, InvalidJobTransitionError) as exc:
+            skipped.append((job_id, "not_retryable", str(exc)))
+    return BulkRetryOutcome(retried=retried, skipped=skipped)
 
 
 # --- leader-side recovery -----------------------------------------------------------

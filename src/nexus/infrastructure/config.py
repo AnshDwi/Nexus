@@ -128,6 +128,10 @@ class Settings(BaseSettings):
     # is re-dispatched (the claim guard makes duplicates harmless).
     reconciler_redispatch_after_seconds: float = 300.0
     daemon_tick_interval_seconds: float = 5.0
+    # The leader scheduler removes nexus.dead-letter messages whose job has
+    # since been retried (see messaging/dead_letter.py). Up to N per pass.
+    dead_letter_prune_resolved: bool = True
+    dead_letter_prune_batch: int = Field(default=200, ge=1, le=5000)
     # Jobs
     worker_heartbeat_ttl_seconds: float = 30.0
     worker_heartbeat_interval_seconds: float = 5.0

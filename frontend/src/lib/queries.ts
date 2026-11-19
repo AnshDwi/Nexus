@@ -1,6 +1,6 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useConnection } from './connection'
-import type { CreateJobInput, JobFilters } from './types'
+import type { BulkRetryInput, CreateJobInput, JobFilters } from './types'
 
 const LIVE = 3000 // dashboards refresh every 3s so status changes show up
 
@@ -99,4 +99,10 @@ export function useRetryJob() {
   const { client } = useConnection()
   const invalidate = useInvalidateJobs()
   return useMutation({ mutationFn: (jobId: string) => client.retryJob(jobId), onSuccess: invalidate })
+}
+
+export function useBulkRetry() {
+  const { client } = useConnection()
+  const invalidate = useInvalidateJobs()
+  return useMutation({ mutationFn: (input: BulkRetryInput) => client.bulkRetry(input), onSuccess: invalidate })
 }

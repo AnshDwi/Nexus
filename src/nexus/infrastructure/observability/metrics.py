@@ -144,3 +144,7 @@ job_recoveries_total = Counter(
 rate_limited_requests_total = Counter(
     "nexus_rate_limited_requests_total", "Requests rejected by the rate limiter.", ["scope"]
 )
+dead_letter_pruned_total = Counter(
+    "nexus_dead_letter_pruned_total",
+    "Broker dead-letter messages removed because their job is no longer dead-lettered.",
+)

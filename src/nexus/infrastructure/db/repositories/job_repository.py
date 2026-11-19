@@ -193,6 +193,11 @@ class PostgresJobStore:
             stmt = stmt.where(JobModel.dead_lettered_at.is_not(None))
         elif query.dead_lettered is False:
             stmt = stmt.where(JobModel.dead_lettered_at.is_(None))
+        if query.error:
+            literal = (
+                query.error.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
+            stmt = stmt.where(JobModel.last_error.ilike(f"%{literal}%", escape="\\"))
         if query.search:
             pattern = f"%{query.search.strip()}%"
             stmt = stmt.where(

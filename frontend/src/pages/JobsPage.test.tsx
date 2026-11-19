@@ -77,4 +77,54 @@ describe('<JobsPage>', () => {
     expect(await screen.findByText('Job submitted')).toBeInTheDocument()
     expect(db.jobs[0].name).toBe('from-ui')
   })
+
+  it('retries selected failed jobs in one request', async () => {
+    db.jobs = [
+      makeJob({ name: 'a', state: 'failed', last_error: 'RuntimeError: disk full' }),
+      makeJob({ name: 'b', state: 'failed' }),
+      makeJob({ name: 'c', state: 'failed' }),
+      makeJob({ name: 'running', state: 'running' }),
+    ]
+    const user = userEvent.setup()
+    renderWithApp(<JobsPage />, { route: '/jobs' })
+    expect(await screen.findByText('RuntimeError: disk full')).toBeInTheDocument()
+    expect(screen.queryByRole('checkbox', { name: 'Select running' })).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('checkbox', { name: 'Select a' }))
+    await user.click(screen.getByRole('checkbox', { name: 'Select c' }))
+    const toolbar = screen.getByRole('toolbar', { name: 'Bulk actions' })
+    expect(within(toolbar).getByText('2 selected')).toBeInTheDocument()
+    await user.click(within(toolbar).getByRole('button', { name: /Retry selected/ }))
+
+    expect(await screen.findByText('Retrying 2 jobs')).toBeInTheDocument()
+    const req = db.requests.filter((r) => r.url.endsWith('/jobs/bulk-retry')).at(-1)!
+    expect(await req.json()).toEqual({ job_ids: [db.jobs[0].job_id, db.jobs[2].job_id] })
+    expect(db.jobs.map((j) => j.state)).toEqual(['retrying', 'failed', 'retrying', 'running'])
+  })
+
+  it('filters dead-lettered jobs by error and retries all matching after confirming', async () => {
+    const dead = new Date().toISOString()
+    db.jobs = [
+      makeJob({ name: 'timeout-1', state: 'failed', dead_lettered_at: dead, last_error: 'TimeoutError: upstream' }),
+      makeJob({ name: 'timeout-2', state: 'failed', dead_lettered_at: dead, last_error: 'TimeoutError: upstream' }),
+      makeJob({ name: 'forbidden', state: 'failed', dead_lettered_at: dead, last_error: 'HTTP 403' }),
+    ]
+    const user = userEvent.setup()
+    renderWithApp(<JobsPage />, { route: '/jobs?dead_lettered=1' })
+    expect(await screen.findByText('forbidden')).toBeInTheDocument()
+
+    await user.type(screen.getByRole('textbox', { name: 'Filter by last error' }), 'timeout')
+    await waitFor(() => expect(screen.queryByText('forbidden')).not.toBeInTheDocument())
+    const listed = new URL(db.requests.filter((r) => r.url.includes('/jobs?')).at(-1)!.url)
+    expect(listed.searchParams.get('error')).toBe('timeout')
+
+    await user.click(screen.getByRole('button', { name: /Retry all matching \(2\)/ }))
+    expect(screen.getByText(/Retry 2 dead-lettered jobs matching “timeout”\?/)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Confirm retry' }))
+
+    expect(await screen.findByText('Retrying 2 jobs')).toBeInTheDocument()
+    const req = db.requests.filter((r) => r.url.endsWith('/jobs/bulk-retry')).at(-1)!
+    expect(await req.json()).toEqual({ dead_lettered: true, error: 'timeout', limit: 100 })
+    expect(db.jobs.find((j) => j.name === 'forbidden')!.state).toBe('failed')
+  })
 })

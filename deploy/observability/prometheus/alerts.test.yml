@@ -1,0 +1,52 @@
+# promtool test rules alerts.test.yml
+rule_files: [alerts.yml]
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'nexus_workers{status="healthy"}'
+        values: '2 2 0 0 0 0'
+      - series: 'nexus_outbox_lag_seconds'
+        values: '0 90 120 180 240 300'
+      - series: 'nexus_jobs_dead_lettered{tenant="dev"}'
+        values: '1 1 1 2 2 2'
+      - series: 'nexus_broker_up'
+        values: '1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: NexusNoHealthyWorkers
+        exp_alerts:
+          - exp_labels: {severity: critical, status: healthy}
+            exp_annotations:
+              summary: No healthy worker is registered; queued jobs will not run
+      - eval_time: 5m
+        alertname: NexusOutboxLag
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: Due dispatch messages have waited 5m 0s for the broker
+              description: The scheduler relay is not running, or RabbitMQ is refusing publishes.
+      - eval_time: 5m
+        alertname: NexusJobsDeadLettered
+        exp_alerts:
+          - exp_labels: {severity: warning, tenant: dev}
+            exp_annotations:
+              summary: New dead-lettered jobs for tenant dev
+              description: Review them in the dashboard (Jobs → Dead-lettered) and retry once fixed.
+      - eval_time: 5m
+        alertname: NexusBrokerDown
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: 'nexus_job_executions_total{job_type="echo",status="completed"}'
+        values: '0+6x30'
+      - series: 'nexus_job_executions_total{job_type="echo",status="failed"}'
+        values: '0+4x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: NexusHighFailureRate
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: 40% of job attempts are failing

@@ -32,9 +32,12 @@ import time
 from datetime import timedelta
 from uuid import uuid4
 
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+
 from nexus.infrastructure.config import EventBus, Settings, get_settings
 from nexus.infrastructure.db.session import create_engine, create_session_factory
 from nexus.infrastructure.execution.maintenance import run_maintenance_pass
+from nexus.infrastructure.messaging.dead_letter import prune_resolved_dead_letters
 from nexus.infrastructure.messaging.factory import (
     create_event_publisher,
     create_vercel_queue_client,
@@ -63,11 +66,24 @@ async def serve_health(heartbeat: Heartbeat, port: int) -> asyncio.Server:
         try:
             request_line = await asyncio.wait_for(reader.readline(), timeout=2)
             path = request_line.split(b" ")[1] if b" " in request_line else b"/"
-            ok = path == b"/health" and heartbeat.healthy
-            status = b"200 OK" if ok else b"503 Service Unavailable"
-            writer.write(
-                b"HTTP/1.1 " + status + b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            )
+            if path == b"/metrics":
+                # This process's prometheus_client counters (job executions,
+                # relay, recoveries). Served on the private health port only.
+                body = generate_latest()
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: "
+                    + CONTENT_TYPE_LATEST.encode()
+                    + b"\r\nContent-Length: "
+                    + str(len(body)).encode()
+                    + b"\r\nConnection: close\r\n\r\n"
+                    + body
+                )
+            else:
+                ok = path == b"/health" and heartbeat.healthy
+                status = b"200 OK" if ok else b"503 Service Unavailable"
+                writer.write(
+                    b"HTTP/1.1 " + status + b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
             await writer.drain()
         except (TimeoutError, ConnectionError, IndexError):
             pass
@@ -126,11 +142,17 @@ async def run_scheduler(settings: Settings, stop: asyncio.Event) -> None:
                     stop.wait(), timeout=settings.outbox_relay_poll_interval_seconds
                 )
 
+    prune_connection = None
+    if settings.event_bus is EventBus.RABBITMQ and settings.dead_letter_prune_resolved:
+        from nexus.infrastructure.messaging.rabbitmq import create_rabbitmq_connection
+
+        prune_connection = await create_rabbitmq_connection(settings.rabbitmq_url)
+
     relay_task = asyncio.create_task(relay_loop())
     try:
         while not stop.is_set():
             try:
-                await run_maintenance_pass(
+                report = await run_maintenance_pass(
                     session_factory,
                     publisher.publisher,
                     settings,
@@ -139,6 +161,15 @@ async def run_scheduler(settings: Settings, stop: asyncio.Event) -> None:
                     relay=relay,
                 )
                 heartbeat.beat()
+                if report.leader and prune_connection is not None:
+                    try:
+                        await prune_resolved_dead_letters(
+                            prune_connection,
+                            session_factory,
+                            limit=settings.dead_letter_prune_batch,
+                        )
+                    except Exception:
+                        logger.exception("dead-letter prune failed")
             except Exception:
                 # Database blips must not kill the loop; a persistent failure
                 # stops heartbeats and the liveness probe restarts us.
@@ -150,6 +181,9 @@ async def run_scheduler(settings: Settings, stop: asyncio.Event) -> None:
         with contextlib.suppress(asyncio.CancelledError):
             await relay_task
         server.close()
+        if prune_connection is not None:
+            with contextlib.suppress(Exception):
+                await prune_connection.close()
         await publisher.close()
         await engine.dispose()
         logger.info("scheduler daemon stopped")

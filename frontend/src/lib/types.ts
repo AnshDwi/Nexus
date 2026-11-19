@@ -182,6 +182,18 @@ export interface JobFilters {
   priority: JobPriority[]
   q: string
   deadLettered?: boolean
+  /** Case-insensitive substring of the job's last error. */
+  error?: string
   page: number
   pageSize: number
+}
+
+export type BulkRetryInput =
+  | { job_ids: string[] }
+  | { dead_lettered: true; error?: string; q?: string; limit?: number }
+
+export interface BulkRetryResult {
+  requested: number
+  retried: Job[]
+  skipped: { job_id: string; code: string; message: string }[]
 }

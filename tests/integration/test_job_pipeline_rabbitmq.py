@@ -524,3 +524,181 @@ async def test_rate_limiting_shared_through_redis(stack: Stack):
     finally:
         stack.app.state.container.redis_pool = None
         await pool.disconnect()
+
+
+async def test_fleet_metrics_come_from_durable_state(stack: Stack):
+    from prometheus_client.parser import text_string_to_metric_families
+    from pydantic import SecretStr
+
+    stack.settings.metrics_token = SecretStr("metrics-secret")
+    ok = (await stack.create({"name": "m-ok", "job_type": "echo"})).json()["job_id"]
+    dead = (
+        await stack.create(
+            {
+                "name": "m-dead",
+                "job_type": "test.fail",
+                "payload": {"message": "boom"},
+                "max_attempts": 2,
+                "initial_backoff_seconds": 0.1,
+                "max_backoff_seconds": 0.1,
+            }
+        )
+    ).json()["job_id"]
+    await stack.wait(ok, "completed")
+    await stack.wait(dead, "failed")
+    await asyncio.sleep(0.3)
+
+    assert (await stack.client.get("/api/v1/internal/metrics")).status_code == 401
+    r = await stack.client.get(
+        "/api/v1/internal/metrics", headers={"Authorization": "Bearer metrics-secret"}
+    )
+    assert r.status_code == 200
+    samples = {
+        (s.name, tuple(sorted(s.labels.items()))): s.value
+        for family in text_string_to_metric_families(r.text)
+        for s in family.samples
+    }
+
+    def value(name: str, **labels: str) -> float:
+        return samples[(name, tuple(sorted(labels.items())))]
+
+    assert value("nexus_jobs", tenant="acme", state="completed") == 1
+    assert value("nexus_jobs", tenant="acme", state="failed") == 1
+    assert value("nexus_jobs", tenant="acme", state="running") == 0
+    assert value("nexus_jobs_dead_lettered", tenant="acme") == 1
+    assert value("nexus_job_executions_total", job_type="echo", status="completed") == 1
+    assert value("nexus_job_executions_total", job_type="test.fail", status="failed") == 2
+    assert value("nexus_job_execution_duration_seconds_count", job_type="test.fail") == 2
+    assert value("nexus_outbox_due") == 0 and value("nexus_outbox_lag_seconds") == 0
+    assert value("nexus_workers", status="healthy") == 1
+    assert value("nexus_worker_capacity_slots") >= 1
+    assert value("nexus_state_database_up") == 1
+    assert value("nexus_broker_up") == 1
+    assert value("nexus_broker_dead_letter_messages") == 1
+    assert value("nexus_broker_consumers") >= 1
+
+
+async def _dead(
+    stack: Stack, name: str, message: str, headers: dict[str, str] | None = None
+) -> str:
+    r = await stack.create(
+        {
+            "name": name,
+            "job_type": "test.fail",
+            "payload": {"message": message},
+            "max_attempts": 1,
+        },
+        headers,
+    )
+    job_id: str = r.json()["job_id"]
+    for _ in range(200):
+        d = await stack.client.get(f"/api/v1/jobs/{job_id}", headers=headers or AUTH_A)
+        if d.json()["job"]["state"] == "failed":
+            return job_id
+        await asyncio.sleep(0.1)
+    raise AssertionError(f"{name} did not fail")
+
+
+async def test_error_filter_and_bulk_retry(stack: Stack):
+    disk = [await _dead(stack, f"disk-{i}", "disk full on /var") for i in range(3)]
+    quota = await _dead(stack, "quota", "quota 100% used")
+    other_tenant = await _dead(stack, "b", "disk full on /var", AUTH_B)
+    done = (await stack.create({"name": "ok", "job_type": "echo"})).json()["job_id"]
+    await stack.wait(done, "completed")
+
+    listed = (
+        await stack.client.get(
+            "/api/v1/jobs", params={"dead_lettered": "true", "error": "DISK FULL"}, headers=AUTH_A
+        )
+    ).json()
+    assert {j["job_id"] for j in listed["items"]} == set(disk)
+    # LIKE wildcards in the filter are matched literally.
+    pct = (await stack.client.get("/api/v1/jobs", params={"error": "100%"}, headers=AUTH_A)).json()
+    assert [j["job_id"] for j in pct["items"]] == [quota]
+    assert (await stack.client.get("/api/v1/jobs", params={"error": "1_0"}, headers=AUTH_A)).json()[
+        "total"
+    ] == 0
+
+    # Explicit ids: one retried, the rest reported, nothing else touched.
+    r = await stack.client.post(
+        "/api/v1/jobs/bulk-retry",
+        json={"job_ids": [quota, done, other_tenant, str(uuid4()), quota]},
+        headers=AUTH_A,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [j["job_id"] for j in body["retried"]] == [quota]
+    assert {(s["job_id"], s["code"]) for s in body["skipped"]} >= {
+        (done, "not_retryable"),
+        (other_tenant, "not_found"),
+    }
+    assert body["requested"] == 5
+
+    # By filter: every dead-lettered "disk full" job of this tenant only.
+    r = await stack.client.post(
+        "/api/v1/jobs/bulk-retry",
+        json={"dead_lettered": True, "error": "disk full"},
+        headers=AUTH_A,
+    )
+    assert r.status_code == 200, r.text
+    assert {j["job_id"] for j in r.json()["retried"]} == set(disk)
+    for job_id in disk:
+        detail = await stack.wait(job_id, "failed")  # test.fail fails again ...
+        assert detail["job"]["attempt"] == 2  # ... but it really ran a second time
+    untouched = await stack.client.get(f"/api/v1/jobs/{other_tenant}", headers=AUTH_B)
+    assert untouched.json()["job"]["attempt"] == 1  # the other tenant's job is not retried
+
+    bad = await stack.client.post(
+        "/api/v1/jobs/bulk-retry", json={"job_ids": [quota], "dead_lettered": True}, headers=AUTH_A
+    )
+    assert bad.status_code == 422
+    assert (
+        await stack.client.post("/api/v1/jobs/bulk-retry", json={}, headers=AUTH_A)
+    ).status_code == 422
+
+
+async def test_prune_removes_only_resolved_dead_letters(stack: Stack):
+    from nexus.infrastructure.messaging.dead_letter import prune_resolved_dead_letters
+
+    resolved = (
+        await stack.create(
+            {
+                "name": "recovers",
+                "job_type": "test.flaky",
+                "payload": {"succeed_on_attempt": 2},
+                "max_attempts": 1,
+            }
+        )
+    ).json()["job_id"]
+    await stack.wait(resolved, "failed")
+    still_dead = await _dead(stack, "stays-dead", "permanent")
+    channel = await stack.connection.channel()
+    exchange = await channel.get_exchange(EVENTS_EXCHANGE)
+    await exchange.publish(  # poison: cannot be attributed to a job, must be kept
+        aio_pika.Message(body=b"not json", message_id="poison-2"),
+        routing_key=JOB_DISPATCH_ROUTING_KEY,
+    )
+    await channel.close()
+    for _ in range(50):
+        if await stack.queue_count(DEAD_LETTER_QUEUE) == 3:
+            break
+        await asyncio.sleep(0.1)
+    assert await stack.queue_count(DEAD_LETTER_QUEUE) == 3
+
+    retried = await stack.client.post(f"/api/v1/jobs/{resolved}/retry", headers=AUTH_A)
+    assert retried.status_code == 200
+    await stack.wait(resolved, "completed")
+
+    report = await prune_resolved_dead_letters(stack.connection, stack.session_factory)
+    assert (report.inspected, report.pruned, report.kept) == (3, 1, 2)
+    assert await stack.queue_count(DEAD_LETTER_QUEUE) == 2
+    again = await prune_resolved_dead_letters(stack.connection, stack.session_factory)
+    assert (again.pruned, again.kept) == (0, 2)  # idempotent; kept messages are still there
+
+    # The operator endpoint does the same, behind CRON_SECRET.
+    assert (await stack.client.post("/api/v1/internal/dead-letter/prune")).status_code == 401
+    r = await stack.client.post(
+        "/api/v1/internal/dead-letter/prune", headers={"Authorization": f"Bearer {CRON}"}
+    )
+    assert r.status_code == 200 and r.json()["pruned"] == 0
+    assert (await stack.detail(still_dead))["job"]["dead_lettered_at"] is not None

@@ -14,6 +14,7 @@ class JobQuery:
     priorities: frozenset[JobPriority] = frozenset()
     search: str | None = None
     dead_lettered: bool | None = None
+    error: str | None = None  # case-insensitive substring of last_error
     page: int = 1
     page_size: int = 25
 

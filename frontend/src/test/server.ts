@@ -47,11 +47,13 @@ export const handlers = [
     const statuses = url.searchParams.getAll('status')
     const q = url.searchParams.get('q') ?? ''
     const deadOnly = url.searchParams.get('dead_lettered') === 'true'
+    const error = (url.searchParams.get('error') ?? '').toLowerCase()
     const items = db.jobs.filter(
       (j) =>
         (statuses.length === 0 || statuses.includes(j.state)) &&
         (!q || j.name.includes(q)) &&
-        (!deadOnly || j.dead_lettered_at !== null),
+        (!deadOnly || j.dead_lettered_at !== null) &&
+        (!error || (j.last_error ?? '').toLowerCase().includes(error)),
     )
     return HttpResponse.json({ items, total: items.length, page: 1, page_size: 20, pages: 1 })
   }),
@@ -81,6 +83,27 @@ export const handlers = [
     if (!job) return HttpResponse.json({ detail: { code: 'not_found', message: 'job not found' } }, { status: 404 })
     Object.assign(job, { state: 'cancelled', can_cancel: false })
     return HttpResponse.json(job)
+  }),
+  http.post(`${API}/jobs/bulk-retry`, async ({ request }) => {
+    const body = (await request.json()) as { job_ids?: string[]; dead_lettered?: boolean; error?: string; limit?: number }
+    const ids =
+      body.job_ids ??
+      db.jobs
+        .filter((j) => j.state === 'failed' && j.dead_lettered_at && (!body.error || (j.last_error ?? '').toLowerCase().includes(body.error.toLowerCase())))
+        .slice(0, body.limit ?? 100)
+        .map((j) => j.job_id)
+    const retried: Job[] = []
+    const skipped: { job_id: string; code: string; message: string }[] = []
+    for (const id of ids) {
+      const job = db.jobs.find((j) => j.job_id === id)
+      if (!job) skipped.push({ job_id: id, code: 'not_found', message: 'job not found' })
+      else if (job.state !== 'failed') skipped.push({ job_id: id, code: 'not_retryable', message: 'only failed jobs can be retried' })
+      else {
+        Object.assign(job, { state: 'retrying', can_retry: false, can_cancel: true, attempt: job.attempt + 1, dead_lettered_at: null })
+        retried.push(job)
+      }
+    }
+    return HttpResponse.json({ requested: ids.length, retried, skipped })
   }),
   http.post(`${API}/jobs/:id/retry`, ({ params }) => {
     const job = db.jobs.find((j) => j.job_id === params.id)

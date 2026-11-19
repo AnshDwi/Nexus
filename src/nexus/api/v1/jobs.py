@@ -4,7 +4,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nexus.api.rate_limit import rate_limit
@@ -19,6 +19,7 @@ from nexus.application.use_cases.jobs import (
     cancel_job,
     create_job,
     retry_job,
+    retry_jobs,
 )
 from nexus.domain.job import (
     CANCELLABLE_JOB_STATES,
@@ -183,6 +184,37 @@ class JobPageOut(BaseModel):
     pages: int
 
 
+class BulkRetryIn(BaseModel):
+    """Either name the jobs, or select dead-lettered jobs by filter."""
+
+    model_config = ConfigDict(extra="forbid")
+    job_ids: list[UUID] | None = Field(default=None, min_length=1, max_length=100)
+    dead_lettered: bool = False
+    error: str | None = Field(default=None, min_length=1, max_length=200)
+    q: str | None = Field(default=None, min_length=1, max_length=200)
+    limit: int = Field(default=100, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def _one_selection(self) -> "BulkRetryIn":
+        if (self.job_ids is None) == (not self.dead_lettered):
+            raise ValueError("give either job_ids or dead_lettered=true")
+        if self.job_ids is not None and (self.error or self.q):
+            raise ValueError("error and q filter dead-lettered selection only")
+        return self
+
+
+class SkippedOut(BaseModel):
+    job_id: UUID
+    code: str
+    message: str
+
+
+class BulkRetryOut(BaseModel):
+    requested: int
+    retried: list[JobOut]
+    skipped: list[SkippedOut]
+
+
 class CancelIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
     reason: str = Field(default="cancelled by user", min_length=1, max_length=500)
@@ -291,6 +323,7 @@ async def list_jobs(
     priority: Annotated[list[JobPriority] | None, Query()] = None,
     q: Annotated[str | None, Query(max_length=200)] = None,
     dead_lettered: Annotated[bool | None, Query()] = None,
+    error: Annotated[str | None, Query(max_length=200)] = None,
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(ge=1, le=100)] = 25,
 ) -> JobPageOut:
@@ -301,6 +334,7 @@ async def list_jobs(
             priorities=frozenset(priority or ()),
             search=q or None,
             dead_lettered=dead_lettered,
+            error=error or None,
             page=page,
             page_size=page_size,
         )
@@ -311,6 +345,50 @@ async def list_jobs(
         page=result.page,
         page_size=result.page_size,
         pages=max((result.total + page_size - 1) // page_size, 1),
+    )
+
+
+@router.post("/bulk-retry", response_model=BulkRetryOut)
+async def bulk_retry(
+    body: BulkRetryIn,
+    request: Request,
+    principal: Writer,
+    session: Session,
+    settings: AppSettings,
+) -> BulkRetryOut:
+    """Retry up to 100 final failures at once: the listed `job_ids`, or the
+    dead-lettered jobs matching `error` (substring of the last error) and `q`.
+    Jobs that cannot be retried are reported in `skipped`."""
+    store = PostgresJobStore(session)
+    if body.job_ids is not None:
+        ids = body.job_ids
+    else:
+        page = await store.search(
+            JobQuery(
+                tenant_id=principal.tenant_id,
+                states=frozenset({JobState.FAILED}),
+                dead_lettered=True,
+                error=body.error,
+                search=body.q,
+                page=1,
+                page_size=body.limit,
+            )
+        )
+        ids = [job.job_id for job in page.items]
+    outcome = await retry_jobs(
+        store, PostgresOutboxWriter(session), job_ids=ids, tenant_id=principal.tenant_id
+    )
+    await session.commit()
+    if outcome.retried:
+        await _relay(request, settings)
+    session.expire_all()
+    return BulkRetryOut(
+        requested=len(ids),
+        retried=[
+            JobOut.of(await _reload(session, job.job_id, principal.tenant_id))
+            for job in outcome.retried
+        ],
+        skipped=[SkippedOut(job_id=j, code=c, message=m) for j, c, m in outcome.skipped],
     )
 
 

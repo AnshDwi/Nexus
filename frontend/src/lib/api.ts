@@ -1,4 +1,6 @@
 import type {
+  BulkRetryInput,
+  BulkRetryResult,
   CreateJobInput,
   Execution,
   Job,
@@ -125,6 +127,7 @@ export class NexusClient {
     filters.priority.forEach((p) => query.append('priority', p))
     if (filters.q.trim()) query.set('q', filters.q.trim())
     if (filters.deadLettered) query.set('dead_lettered', 'true')
+    if (filters.error?.trim()) query.set('error', filters.error.trim())
     return this.request<Paged<Job>>('GET', '/jobs', { query })
   }
   getJob(jobId: string) {
@@ -140,6 +143,9 @@ export class NexusClient {
   }
   retryJob(jobId: string) {
     return this.request<Job>('POST', `/jobs/${encodeURIComponent(jobId)}/retry`)
+  }
+  bulkRetry(input: BulkRetryInput) {
+    return this.request<BulkRetryResult>('POST', '/jobs/bulk-retry', { body: input })
   }
   workers() {
     return this.request<Worker[]>('GET', '/workers')

@@ -1,0 +1,91 @@
+groups:
+  - name: nexus-availability
+    rules:
+      - alert: NexusApiDown
+        expr: up{job="nexus-api"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: NEXUS API is not answering metrics scrapes
+          description: "{{ $labels.instance }} has been unreachable for 2 minutes."
+
+      - alert: NexusDatabaseUnreadable
+        expr: nexus_state_database_up == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: The API cannot read the jobs, outbox or worker tables
+
+      - alert: NexusBrokerDown
+        expr: nexus_broker_up == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: RabbitMQ queues cannot be inspected; dispatch is stalled
+
+      - alert: NexusNoHealthyWorkers
+        expr: nexus_workers{status="healthy"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: No healthy worker is registered; queued jobs will not run
+
+      - alert: NexusUnhealthyWorkers
+        expr: nexus_workers{status="unhealthy"} > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value }} worker(s) stopped heartbeating"
+          description: Their running jobs are recovered by the scheduler; check the worker hosts.
+
+  - name: nexus-pipeline
+    rules:
+      - alert: NexusOutboxLag
+        expr: nexus_outbox_lag_seconds > 60
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "Due dispatch messages have waited {{ $value | humanizeDuration }} for the broker"
+          description: The scheduler relay is not running, or RabbitMQ is refusing publishes.
+
+      - alert: NexusOutboxFailedPermanently
+        expr: nexus_outbox_failed_permanently > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value }} outbox message(s) were given up on by the relay"
+
+      - alert: NexusQueueBacklog
+        expr: nexus_jobs_oldest_waiting_seconds > 300
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "The oldest waiting job has waited {{ $value | humanizeDuration }}"
+          description: Add worker capacity or check for a stuck worker.
+
+      - alert: NexusCapacitySaturated
+        expr: nexus_worker_capacity_slots > 0 and nexus_worker_busy_slots >= nexus_worker_capacity_slots
+        for: 10m
+        labels: {severity: info}
+        annotations:
+          summary: Every worker slot has been busy for 10 minutes
+
+  - name: nexus-outcomes
+    rules:
+      - alert: NexusJobsDeadLettered
+        expr: delta(nexus_jobs_dead_lettered[15m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "New dead-lettered jobs for tenant {{ $labels.tenant }}"
+          description: Review them in the dashboard (Jobs → Dead-lettered) and retry once fixed.
+
+      - alert: NexusHighFailureRate
+        expr: |
+          (
+            sum(rate(nexus_job_executions_total{status=~"failed|timed_out|lost"}[10m]))
+            / sum(rate(nexus_job_executions_total[10m]))
+          ) > 0.25
+          and sum(rate(nexus_job_executions_total[10m])) > 0.01
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of job attempts are failing"

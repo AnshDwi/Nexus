@@ -30,9 +30,10 @@ Dashboard (React) ──► API (FastAPI) ──► PostgreSQL ◄────�
 3. [Architecture](#architecture)
 4. [API reference](#api-reference)
 5. [Configuration](#configuration)
-6. [Testing](#testing)
-7. [Deploying to Vercel](#deploying-to-vercel)
-8. [Known limitations](#known-limitations)
+6. [Monitoring](#monitoring)
+7. [Testing](#testing)
+8. [Deploying to Vercel](#deploying-to-vercel)
+9. [Known limitations](#known-limitations)
 
 ---
 
@@ -76,7 +77,8 @@ All ports bind to 127.0.0.1. Change any of them with `*_HOST_PORT` in `.env`.
 1. **Submit a job.** *Jobs → Create job*, type `echo`, payload `{"msg":"hi"}`.
 2. **View its execution.** Open the job. Its timeline shows PENDING → QUEUED → RUNNING → COMPLETED, with the attempt, worker and duration. *Executions* lists every attempt.
 3. **Trigger a failure and a retry.** Create a `test.flaky` job with payload `{"succeed_on_attempt": 3}` and *Max attempts* 2. It fails, waits out the backoff (RETRYING), fails again and is dead-lettered. Click **Retry** and it completes on attempt 3.
-4. **View dead-lettered jobs.** Use the *Dead-lettered* chip on *Jobs*, or *Queue → View dead-lettered jobs*. The broker side is the `nexus.dead-letter` queue in the RabbitMQ UI.
+4. **View dead-lettered jobs.** Use the *Dead-lettered* chip on *Jobs*, or *Queue → View dead-lettered jobs*. Each failed row shows its last error. The broker side is the `nexus.dead-letter` queue in the RabbitMQ UI.
+5. **Retry in bulk.** Narrow the list with *Last error contains…* (for example `timeout`). Then either tick rows and use **Retry selected**, or use **Retry all matching** (up to 100, after a confirmation).
 
 The same flow with curl:
 
@@ -195,8 +197,9 @@ Design records:
 1. **Relays the outbox.** It publishes due dispatch messages (`available_at <= now()`) to the `nexus.jobs` exchange with publisher confirms. A message only marks its job QUEUED after the broker confirms it. Unroutable or nacked messages stay in the outbox and are retried.
 2. **Detects dead workers.** It marks workers whose heartbeat is older than `WORKER_HEARTBEAT_TTL_SECONDS` as unhealthy. Their RUNNING jobs are failed and retried.
 3. **Expires leases.** It fails a RUNNING attempt whose execution lease (timeout + grace) has expired, which retries it or dead-letters it.
+4. **Prunes resolved dead letters.** It removes `nexus.dead-letter` messages whose job is no longer dead-lettered for that attempt, because the job was retried. Messages for jobs still dead-lettered, task messages and unparseable (poison) messages are kept. So the broker count matches the dashboard's count of dead-lettered jobs, while each job's full history stays in the database. Turn this off with `DEAD_LETTER_PRUNE_RESOLVED=false`.
 
-On Vercel, the same pass also runs from the `/internal/maintenance` cron as a backstop.
+On Vercel, steps 1–3 also run from the `/internal/maintenance` cron as a backstop, and `POST /internal/dead-letter/prune` does step 4 on demand.
 
 ### How workers execute jobs
 
@@ -243,10 +246,11 @@ Everything is under `/api/v1`. Authenticate with `Authorization: Bearer <api key
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/jobs` | Create. Body: `name`, `job_type`, `payload`, `priority` (`low\|normal\|high\|critical`), `max_attempts` (1–20), `timeout_seconds`, `initial_backoff_seconds`, `max_backoff_seconds`. `Idempotency-Key` header: replays return the original job (200). 201 created · 422 invalid/rejected · 413 payload too large · 429 rate limited |
-| `GET` | `/jobs` | List with pagination: `page`, `page_size` (≤100), `status` (repeatable), `priority` (repeatable), `q` (name/type/ID search), `dead_lettered=true` (only dead-lettered jobs) |
+| `GET` | `/jobs` | List with pagination: `page`, `page_size` (≤100), `status` (repeatable), `priority` (repeatable), `q` (name/type/ID search), `dead_lettered=true` (only dead-lettered jobs), `error` (case-insensitive substring of the last error) |
 | `GET` | `/jobs/{id}` | Job, state transitions and execution attempts |
 | `POST` | `/jobs/{id}/cancel` | Cancel PENDING/QUEUED/RETRYING/RUNNING (409 otherwise). A running attempt's result is discarded |
 | `POST` | `/jobs/{id}/retry` | Retry a FAILED job with a fresh attempt budget (409 otherwise) |
+| `POST` | `/jobs/bulk-retry` | Retry up to 100 FAILED jobs in one transaction. Body: `{"job_ids": [...]}`, or `{"dead_lettered": true, "error": "...", "q": "...", "limit": 100}` to select dead-lettered jobs by filter. Returns `retried` and `skipped` (with `not_found` / `not_retryable` per job); a skipped job does not undo the others |
 | `GET` | `/workers` | Registered workers: status (healthy/unhealthy/draining), heartbeat age, running jobs vs capacity |
 | `GET` | `/queue` | Pending/queued/retrying jobs by priority with dispatch status; `dead_lettered_jobs` (database) and broker ready/dead-letter message counts |
 | `GET` | `/executions` | Execution history: `status`, `job_id`, `page`, `page_size` |
@@ -254,7 +258,8 @@ Everything is under `/api/v1`. Authenticate with `Authorization: Bearer <api key
 | `GET` | `/system` | Dependency checks, job types, non-secret configuration |
 | `GET` | `/health` · `/ready` | Liveness · readiness (503 when a configured dependency fails) |
 | `GET` | `/internal/maintenance` | Scheduler pass (`Bearer $CRON_SECRET`) |
-| `GET` | `/internal/metrics` | Prometheus (`Bearer $METRICS_TOKEN`) |
+| `GET` | `/internal/metrics` | Prometheus (`Bearer $METRICS_TOKEN`): process counters plus fleet-wide figures from the database and broker (see [Monitoring](#monitoring)) |
+| `POST` | `/internal/dead-letter/prune` | Prune resolved `nexus.dead-letter` messages now (`Bearer $CRON_SECRET`) |
 | | `/tasks…` | DAG task API (see ADR 0004) |
 
 ---
@@ -278,14 +283,57 @@ All configuration comes from environment variables (see `.env.example`). Outside
 | `RATE_LIMIT_READS_PER_MINUTE`, `RATE_LIMIT_WRITES_PER_MINUTE` | Per tenant |
 | `WORKER_CAPACITY`, `WORKER_HEARTBEAT_*`, `WORKER_SHUTDOWN_GRACE_SECONDS` | Worker behaviour |
 | `JOB_DEFAULT_TIMEOUT_SECONDS`, `JOB_MAX_TIMEOUT_SECONDS`, `JOB_DEFAULT_MAX_ATTEMPTS` | Job limits |
-| `CRON_SECRET`, `METRICS_TOKEN` | Protect internal endpoints |
+| `CRON_SECRET`, `METRICS_TOKEN` | Protect internal endpoints (compose default for `METRICS_TOKEN`: `local-metrics-token`) |
+| `DEAD_LETTER_PRUNE_RESOLVED`, `DEAD_LETTER_PRUNE_BATCH` | Scheduler pruning of resolved broker dead letters (default on, 200 per pass) |
 | `TASK_ENABLE_TEST_HANDLERS` | Registers `test.sleep`/`test.flaky`/`test.fail` (local and CI only) |
 | `WORKER_SMALL_CAPACITY` | Compose only: capacity of the second worker |
 | `*_HOST_PORT` | Compose only: host ports (`API_`, `DASHBOARD_`, `POSTGRES_`, `RABBITMQ_`, `RABBITMQ_MANAGEMENT_`, `REDIS_`) |
-| `NEXUS_*_IMAGE` | Compose only: base-image overrides (mirrors) |
+| `NEXUS_*_IMAGE` | Compose only: base-image overrides (mirrors), including `NEXUS_PROMETHEUS_IMAGE` and `NEXUS_GRAFANA_IMAGE` |
+| `PROMETHEUS_HOST_PORT`, `GRAFANA_HOST_PORT`, `PROMETHEUS_RETENTION`, `GRAFANA_ADMIN_PASSWORD` | Compose `observability` profile |
 | `DEMO_API_KEY` | Compose only: key used by the `seed` service (default `dev-key`) |
 
 Logs are JSON lines carrying `request_id`, `correlation_id`, `job_id` and `attempt`.
+
+---
+
+## Monitoring
+
+```bash
+docker compose --profile observability up -d
+```
+
+- **Prometheus** at http://localhost:9090, with the alert rules loaded.
+- **Grafana** at http://localhost:3000. The *NEXUS — Job platform* dashboard is provisioned and opens as the home page. Viewing is anonymous; sign in as `admin` with `GRAFANA_ADMIN_PASSWORD` to edit.
+
+**Where the numbers come from.** The API's `/internal/metrics` serves two kinds of data:
+- its own process counters;
+- fleet-wide figures read from PostgreSQL and RabbitMQ at scrape time.
+
+Because the fleet-wide figures come from durable state, they are complete and identical whichever API instance answers, and survive restarts. That includes Vercel Functions, where in-memory counters reset per instance. Each daemon serves its own counters on its private health port (`:8081/metrics`).
+
+| Metric | Meaning |
+|---|---|
+| `nexus_jobs{tenant,state}` | Jobs in each state |
+| `nexus_jobs_dead_lettered{tenant}` | Jobs currently dead-lettered |
+| `nexus_jobs_oldest_waiting_seconds` | Age of the oldest PENDING/QUEUED job |
+| `nexus_job_executions_total{job_type,status}` | Attempts recorded (counter; use `rate()`) |
+| `nexus_job_execution_duration_seconds_{sum,count}{job_type}` | Attempt durations (average = rate(sum) / rate(count)) |
+| `nexus_outbox_due`, `nexus_outbox_lag_seconds`, `nexus_outbox_failed_permanently` | Dispatches not yet confirmed by the broker |
+| `nexus_workers{status}`, `nexus_worker_capacity_slots`, `nexus_worker_busy_slots` | Worker fleet |
+| `nexus_broker_up`, `nexus_broker_ready_messages`, `nexus_broker_consumers`, `nexus_broker_dead_letter_messages` | RabbitMQ |
+| `nexus_state_database_up` | Whether the state above could be read |
+
+**Alerts** (`deploy/observability/prometheus/alerts.yml`, unit-tested in `alerts.test.yml`):
+
+| Severity | Alerts |
+|---|---|
+| Critical | `NexusApiDown`, `NexusDatabaseUnreadable`, `NexusBrokerDown`, `NexusNoHealthyWorkers` |
+| Warning | `NexusUnhealthyWorkers`, `NexusOutboxLag`, `NexusOutboxFailedPermanently`, `NexusQueueBacklog`, `NexusJobsDeadLettered`, `NexusHighFailureRate` |
+| Info | `NexusCapacitySaturated` |
+
+Compose ships no Alertmanager. Point Prometheus at yours (`alerting:` in `prometheus.yml`), or import the rules into Grafana alerting.
+
+**Production on Vercel.** Have a managed Prometheus (for example Grafana Cloud) scrape `https://<api-domain>/api/v1/internal/metrics` with `Bearer $METRICS_TOKEN`. Scrape one URL only: the fleet figures are already global. Then import `deploy/observability/grafana/dashboards/nexus.json` and the alert rules.
 
 ---
 
@@ -302,6 +350,10 @@ cd frontend && npm ci && npm run typecheck && npm run lint && npm test && npm ru
 
 # Migrations: upgrade, model/migration drift check, full downgrade
 uv run alembic upgrade head && uv run alembic check && uv run alembic downgrade base
+
+# Alert rules (needs promtool, or run it from the prom/prometheus image)
+promtool check rules deploy/observability/prometheus/alerts.yml
+cd deploy/observability/prometheus && promtool test rules alerts.test.yml
 
 # Whole stack, end to end against the running containers
 docker compose config --quiet
@@ -356,7 +408,9 @@ See **[docs/vercel-deployment.md](docs/vercel-deployment.md)**. In short:
 
 - **Vercel Daemons are in public beta** and run only on production deployments. Preview deployments have an API but no scheduler or workers. The `/internal/maintenance` cron relays the outbox, but cannot execute jobs.
 - **Vercel hosts no RabbitMQ.** A managed AMQP broker (for example CloudAMQP) is required in production.
-- **Two broker-level dead-letter counts.** The broker's `nexus.dead-letter` count includes messages for jobs that were dead-lettered and later retried by hand. The dashboard's *Dead-lettered* figure counts jobs currently dead-lettered (`dead_lettered_at` set), from the database. Messages in `nexus.dead-letter` are kept for inspection and are not replayed automatically.
+- **Broker dead letters are not replayed.** Messages in `nexus.dead-letter` are evidence, not a work queue. Retrying a job writes a new dispatch, and the scheduler then prunes the old message. Until the next scheduler pass (every few seconds), the broker count can briefly exceed the dashboard's. Without the scheduler daemon (for example on Vercel preview deployments), call `POST /internal/dead-letter/prune`.
+- **Scrape cost grows with history.** `/internal/metrics` runs aggregate queries over `jobs` and `job_executions` on every scrape. That's fine at a 15-second interval for typical volumes; with millions of execution rows, raise the interval or add retention.
+- **Bulk retry is capped at 100 jobs per request.** For larger backlogs, repeat **Retry all matching**; each run takes the next 100.
 - **Rate limiting without Redis is per process.** Set `REDIS_URL` for limits shared across instances.
 - **Tasks API retries over RabbitMQ.** The legacy `/tasks` DAG API retries through the scheduler's reconciler rather than outbox hold-back, so its retry delay is rounded up to the scheduler interval.
 - **Fixed job types.** Workers run only registered handlers (`echo`, `http.webhook`, test types). Arbitrary code is never accepted.

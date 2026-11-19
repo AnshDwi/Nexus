@@ -155,7 +155,6 @@ def seed(client: Client, *, allow_non_local: bool, wait: bool, timeout: float) -
         return 2
 
     run = datetime.now(UTC).strftime("%m%d-%H%M%S")
-    before = client.request("GET", "/queue")["broker"]
     print(f"Seeding demo run {run} into tenant '{system['tenant_id']}' ...")
     submitted: dict[str, tuple[DemoJob, str]] = {}
     for job in scenario():
@@ -215,7 +214,8 @@ def seed(client: Client, *, allow_non_local: bool, wait: bool, timeout: float) -
             f"attempts={j['attempt']}{note}"
         )
 
-    after = client.request("GET", "/queue")["broker"]
+    queue_now = client.request("GET", "/queue")
+    after = queue_now["broker"]
     workers = client.request("GET", "/workers")
     print("\nWorkers (registry):")
     for w in workers:
@@ -223,10 +223,12 @@ def seed(client: Client, *, allow_non_local: bool, wait: bool, timeout: float) -
             f"  {w['worker_id'][:8]} {w['status']:<9} capacity={w['capacity_slots']} "
             f"executions in this run={workers_used.get(w['worker_id'], 0)}"
         )
-    if after.get("available") and before.get("available"):
-        added = (after["dead_letter_messages"] or 0) - (before["dead_letter_messages"] or 0)
-        total = after["dead_letter_messages"]
-        print(f"\nBroker dead-letter queue: +{added} message(s) (now {total})")
+    if after.get("available"):
+        print(
+            f"\nDead-lettered: {queue_now['dead_lettered_jobs']} job(s) in the database, "
+            f"{after['dead_letter_messages']} message(s) in RabbitMQ nexus.dead-letter "
+            "(the scheduler prunes messages whose job was retried)"
+        )
     print("\nDemo " + ("verified." if failures == 0 else f"had {failures} unexpected result(s)."))
     return 0 if failures == 0 else 1
 

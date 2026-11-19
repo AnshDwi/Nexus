@@ -6,9 +6,11 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "build:pages": "tsc -b && vite build --mode pages && node scripts/pages-fallback.mjs && node scripts/check-pages-build.mjs",
     "lint": "oxlint",
     "preview": "vite preview",
     "test": "vitest run",
+    "test:demo": "vitest run --mode pages src/demo",
     "test:watch": "vitest",
     "typecheck": "tsc -b"
   },

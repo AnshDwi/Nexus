@@ -1,4 +1,4 @@
-import { CheckCircle2, CircleSlash, XCircle } from 'lucide-react'
+import { CheckCircle2, CircleSlash, FlaskConical, XCircle } from 'lucide-react'
 import { ConnectionForm } from '../components/ConnectionForm'
 import { PageHeader } from '../components/PageHeader'
 import { ErrorState, LoadingState } from '../components/States'
@@ -7,8 +7,9 @@ import { useConnection } from '../lib/connection'
 import { useSystem } from '../lib/queries'
 
 function CheckRow({ name, value }: { name: string; value: string }) {
-  const Icon = value === 'ok' ? CheckCircle2 : value === 'not_configured' ? CircleSlash : XCircle
-  const tone = value === 'ok' ? 'text-emerald-400' : value === 'not_configured' ? 'text-ink-400' : 'text-rose-400'
+  const Icon = value === 'ok' ? CheckCircle2 : value === 'simulated' ? FlaskConical : value === 'not_configured' ? CircleSlash : XCircle
+  const tone =
+    value === 'ok' ? 'text-emerald-400' : value === 'simulated' ? 'text-amber-300' : value === 'not_configured' ? 'text-ink-400' : 'text-rose-400'
   return (
     <li className="flex items-center justify-between py-2.5">
       <span className="text-sm capitalize text-ink-200">{name}</span>
@@ -25,13 +26,24 @@ export function SettingsPage() {
     <>
       <PageHeader title="Settings" description="API connection, system health and active configuration." />
       <div className="grid gap-6 lg:grid-cols-2">
-        <section className="card p-5" aria-label="API connection">
-          <h2 className="mb-4 text-sm font-semibold text-ink-100">API connection</h2>
-          <ConnectionForm />
-          <button type="button" className="btn-ghost mt-3 text-xs" onClick={() => { disconnect(); notify({ tone: 'success', title: 'API key removed from this browser' }) }}>
-            Sign out
-          </button>
-        </section>
+        {__NEXUS_DEMO__ ? (
+          <section className="card p-5" aria-label="API connection">
+            <h2 className="mb-4 text-sm font-semibold text-ink-100">API connection</h2>
+            <p className="text-sm text-ink-300">
+              This is the demo build. Its API client talks to a simulator running in your browser, so no API key is needed
+              and nothing is sent to a server. Run the full stack with <code className="font-mono text-ink-200">docker compose up --build</code> to
+              connect this dashboard to a real NEXUS API.
+            </p>
+          </section>
+        ) : (
+          <section className="card p-5" aria-label="API connection">
+            <h2 className="mb-4 text-sm font-semibold text-ink-100">API connection</h2>
+            <ConnectionForm />
+            <button type="button" className="btn-ghost mt-3 text-xs" onClick={() => { disconnect(); notify({ tone: 'success', title: 'API key removed from this browser' }) }}>
+              Sign out
+            </button>
+          </section>
+        )}
         <section className="card p-5" aria-label="System health">
           <h2 className="mb-2 text-sm font-semibold text-ink-100">System health</h2>
           {isLoading ? <LoadingState rows={3} /> : error || !data ? <ErrorState error={error} onRetry={() => void refetch()} /> : (

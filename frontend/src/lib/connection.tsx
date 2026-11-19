@@ -1,4 +1,6 @@
 import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from 'react'
+import { demoFetch } from '../demo'
+import { DEMO_API_KEY } from '../demo/mode'
 import { NexusClient, type Connection } from './api'
 
 const STORAGE_KEY = 'nexus.connection'
@@ -33,7 +35,10 @@ export function ConnectionProvider({
   children: ReactNode
   initial?: Connection
 }) {
-  const [connection, setState] = useState<Connection>(() => initial ?? load())
+  // Demo builds talk to the in-browser simulator; nothing is stored or sent.
+  const [connection, setState] = useState<Connection>(
+    () => initial ?? (__NEXUS_DEMO__ ? { baseUrl: '', apiKey: DEMO_API_KEY } : load()),
+  )
   const setConnection = useCallback((c: Connection) => {
     setState(c)
     try {
@@ -50,7 +55,10 @@ export function ConnectionProvider({
       /* ignore */
     }
   }, [])
-  const client = useMemo(() => new NexusClient(connection), [connection])
+  const client = useMemo(
+    () => (__NEXUS_DEMO__ ? new NexusClient(connection, demoFetch) : new NexusClient(connection)),
+    [connection],
+  )
   const value = useMemo(
     () => ({ connection, client, setConnection, disconnect }),
     [connection, client, setConnection, disconnect],

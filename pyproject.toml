@@ -13,7 +13,20 @@ dependencies = [
     "redis>=5.2",
     "aio-pika>=9.5",
     "prometheus-client>=0.21",
+    "vercel-queue>=0.11,<0.12",
+    "httpx>=0.27",
 ]
+
+[tool.vercel]
+# The FastAPI app Vercel serves as one Python Function (Fluid compute).
+entrypoint = "vercel_app.api:app"
+
+# Vercel Queues push-mode consumer. At build time Vercel imports the module,
+# reads its @subscribe registrations and generates a private queue-triggered
+# function. Remove this entry if you run the poll-mode worker daemon instead
+# (a consumer group is either push or poll).
+[[tool.vercel.subscribers]]
+entrypoint = "vercel_app.queue_subscriber"
 
 [dependency-groups]
 dev = [
@@ -28,14 +41,17 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "-m 'not integration'"
+addopts = "-m 'not integration and not e2e'"
 markers = [
     "integration: requires live infrastructure (Postgres/Redis/RabbitMQ) via docker compose; run explicitly with -m integration",
+    "e2e: black-box tests against a running `docker compose` stack; run explicitly with -m e2e",
 ]
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Vercel build artifacts (`vercel build` output and generated queue handlers).
+extend-exclude = [".vercel", "_vc_queue_handlers"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]

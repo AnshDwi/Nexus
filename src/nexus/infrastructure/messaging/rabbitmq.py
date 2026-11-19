@@ -26,6 +26,7 @@ async def create_rabbitmq_connection(rabbitmq_url: str) -> AbstractRobustConnect
     return await aio_pika.connect_robust(rabbitmq_url)
 
 
-def get_rabbitmq_connection(request: Request) -> AbstractRobustConnection:
-    connection: AbstractRobustConnection = request.app.state.container.rabbitmq_connection
+def get_rabbitmq_connection(request: Request) -> AbstractRobustConnection | None:
+    """None unless EVENT_BUS=rabbitmq."""
+    connection: AbstractRobustConnection | None = request.app.state.container.rabbitmq_connection
     return connection

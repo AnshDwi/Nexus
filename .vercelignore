@@ -1,0 +1,15 @@
+.venv
+.git
+.github
+.mypy_cache
+.pytest_cache
+.ruff_cache
+tests
+docs
+docker-compose.yml
+.env
+.env.*
+!.env.example
+
+# Dashboard (separate Vercel project)
+frontend

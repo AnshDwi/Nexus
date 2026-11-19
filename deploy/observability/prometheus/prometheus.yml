@@ -1,0 +1,31 @@
+# Scrapes the NEXUS compose stack (docker compose --profile observability up).
+#
+# * nexus-api: /api/v1/internal/metrics, guarded by METRICS_TOKEN. Carries the
+#   fleet-wide figures read from PostgreSQL and RabbitMQ at scrape time
+#   (nexus_jobs, nexus_outbox_*, nexus_workers, nexus_broker_*), so scrape a
+#   single API instance; on Vercel point this at the deployment URL instead.
+# * nexus-daemons: each daemon's private health port (/metrics) with its own
+#   process counters (executions, relay, recoveries, leadership).
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: nexus-api
+    metrics_path: /api/v1/internal/metrics
+    authorization:
+      type: Bearer
+      credentials_file: /run/secrets/metrics_token
+    static_configs:
+      - targets: ["api:8000"]
+
+  - job_name: nexus-daemons
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["scheduler:8081"]
+        labels: {component: scheduler}
+      - targets: ["worker:8081", "worker-small:8081"]
+        labels: {component: worker}

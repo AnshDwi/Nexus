@@ -1,9 +1,9 @@
 import logging
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import or_, select
+from sqlalchemy import ColumnElement, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -53,7 +53,10 @@ class PostgresLeaderElection:
     async def try_acquire_or_renew(self) -> LeaseStatus:
         start = time.perf_counter()
         try:
-            now = datetime.now(UTC)
+            # Expiry is computed and compared with the database's clock, never
+            # a replica's: replicas with skewed clocks must agree on whether a
+            # lease has lapsed, or a fast clock could steal a live lease.
+            now = func.statement_timestamp()
             was_leader = await self._was_leader_before(now)
             status = await self._acquire_or_renew(now)
             self._record_outcome(was_leader=was_leader, status=status)
@@ -69,20 +72,45 @@ class PostgresLeaderElection:
         finally:
             scheduler_lease_acquisition_latency_seconds.observe(time.perf_counter() - start)
 
-    async def _was_leader_before(self, now: datetime) -> bool:
+    async def holds_lease(self, fencing_token: int) -> bool:
+        """Fencing check for a leader about to write.
+
+        True only if this replica still holds the lease *with this exact
+        token* and it has not expired (database clock). The row is locked
+        FOR SHARE until the caller's transaction ends, so a competing
+        replica cannot take the lease over (which needs an UPDATE) while
+        the caller's writes are in flight: the writes either commit under a
+        valid lease or the caller aborts. A paused leader that wakes up with
+        an old token is therefore rejected here.
+        """
         row = (
             await self._session.execute(
-                select(LeaderLeaseModel.holder_id, LeaderLeaseModel.expires_at).where(
+                select(LeaderLeaseModel.lease_name)
+                .where(
+                    LeaderLeaseModel.lease_name == self._lease_name,
+                    LeaderLeaseModel.holder_id == self._replica_id,
+                    LeaderLeaseModel.fencing_token == fencing_token,
+                    LeaderLeaseModel.expires_at > func.statement_timestamp(),
+                )
+                .with_for_update(read=True)
+            )
+        ).first()
+        return row is not None
+
+    async def _was_leader_before(self, now: ColumnElement[datetime]) -> bool:
+        row = (
+            await self._session.execute(
+                select(LeaderLeaseModel.holder_id, LeaderLeaseModel.expires_at > now).where(
                     LeaderLeaseModel.lease_name == self._lease_name
                 )
             )
         ).first()
         if row is None:
             return False
-        holder_id, expires_at = row
-        return bool(holder_id == self._replica_id and expires_at > now)
+        holder_id, still_valid = row
+        return bool(holder_id == self._replica_id and still_valid)
 
-    async def _acquire_or_renew(self, now: datetime) -> LeaseStatus:
+    async def _acquire_or_renew(self, now: ColumnElement[datetime]) -> LeaseStatus:
         new_expiry = now + self._lease_duration
         stmt = (
             pg_insert(LeaderLeaseModel)

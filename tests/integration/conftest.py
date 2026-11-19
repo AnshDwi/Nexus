@@ -39,3 +39,27 @@ async def worker_registry_session_factory():
         await session.execute(delete(WorkerRegistrationModel))
         await session.commit()
     await engine.dispose()
+
+
+@pytest.fixture
+async def task_session_factory():
+    """Clean tasks/outbox/lease tables before and after each test."""
+    from sqlalchemy import text
+
+    engine = create_engine(get_settings().database_url)
+    factory = create_session_factory(engine)
+
+    async def _truncate() -> None:
+        async with factory() as session:
+            await session.execute(
+                text(
+                    "TRUNCATE task_transitions, tasks, outbox_records, scheduler_leader_lease "
+                    "RESTART IDENTITY CASCADE"
+                )
+            )
+            await session.commit()
+
+    await _truncate()
+    yield factory
+    await _truncate()
+    await engine.dispose()

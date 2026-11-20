@@ -21,6 +21,17 @@ Dashboard (React) ──► API (FastAPI) ──► PostgreSQL ◄────�
                   relay retries · dead-worker detection · lease expiry
 ```
 
+## Documentation
+
+| Guide | For |
+|---|---|
+| [Local development](docs/LOCAL_DEVELOPMENT.md) | Starting, stopping, resetting, testing and debugging on your machine |
+| [Learning guide](docs/LEARNING_GUIDE.md) | How NEXUS works, from the code: request and job lifecycles, outbox, inbox, retries, DLQ, scheduler, failure recovery |
+| [Interview guide](docs/INTERVIEW_GUIDE.md) | Questions and answers grounded in the implementation, with limitations and trade-offs |
+| [Roadmap](docs/ROADMAP.md) | Next engineering phases: reliability, fair scheduling, DAGs, observability, performance, security, DX |
+| [Production deployment](docs/PRODUCTION_DEPLOYMENT.md) · [review](docs/FINAL_DEPLOYMENT_REVIEW.md) | Optional: running the real stack on a server (kept as a learning resource) |
+| [GitHub Pages demo](docs/github-pages-demo.md) | The static, simulated dashboard demo |
+
 ## Live demo
 
 > **Status: not deployed yet.** The [Pages workflow](.github/workflows/pages.yml) publishes the demo to `https://anshdwi.github.io/Nexus/` once GitHub Pages is enabled (**Settings → Pages → Source: GitHub Actions**) and the change is merged into `main`. This line will link to the live site after the first verified deployment.
@@ -99,11 +110,13 @@ Everything else — real execution, RabbitMQ, persistence, monitoring — runs w
 Requires only Docker with Compose v2. Nothing else needs to be installed or running.
 
 ```bash
-git clone <repo-url> nexus && cd nexus
-cp .env.example .env            # optional: compose has working local defaults
+git clone https://github.com/AnshDwi/Nexus.git && cd Nexus
+cp .env.example .env            # optional: local defaults; also turns on Prometheus + Grafana
 docker compose up --build -d --wait
 docker compose ps               # every service healthy; migrate "exited (0)"
 ```
+
+Open the dashboard at http://localhost:5173 (API key `dev-key`). The API docs are at http://localhost:8000/api/docs. With `.env` copied, Grafana is at http://localhost:3000 and Prometheus at http://localhost:9090, because `.env.example` sets `COMPOSE_PROFILES=observability`.
 
 `--wait` returns once every health check passes. That takes about 20 s with cached images, and longer on the first build.
 
@@ -169,9 +182,13 @@ You can run it repeatedly; each run uses fresh idempotency keys.
 **Stop and reset:**
 
 ```bash
-docker compose down        # stop; data in the volumes is kept
-docker compose down -v     # stop and delete all data
+docker compose --profile "*" down    # stop everything (incl. monitoring/demo); data is kept
+scripts/reset-local.sh               # asks for confirmation, then deletes all local data
 ```
+
+`--profile "*"` matters: a plain `docker compose down` skips services started under a profile (Prometheus, Grafana), which keep running.
+
+[docs/LOCAL_DEVELOPMENT.md](docs/LOCAL_DEVELOPMENT.md) has every everyday command (logs, restarts, consoles, tests, hot-reload frontend, migrations) and troubleshooting.
 
 `docker compose stop` sends SIGTERM. Workers drain: they stop consuming, let in-flight jobs finish within `WORKER_SHUTDOWN_GRACE_SECONDS`, hand unfinished attempts back as RETRYING and deregister. Each worker's `stop_grace_period` is longer than that grace.
 
@@ -354,7 +371,7 @@ Logs are JSON lines carrying `request_id`, `correlation_id`, `job_id` and `attem
 ## Monitoring
 
 ```bash
-docker compose --profile observability up -d
+docker compose --profile observability up -d   # already included if you copied .env.example
 ```
 
 - **Prometheus** at http://localhost:9090, with the alert rules loaded.

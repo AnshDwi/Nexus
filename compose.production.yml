@@ -8,6 +8,10 @@
 # refuses to start ("required variable ... is missing") if one is absent, and
 # the API refuses to start with default or published development credentials.
 #
+# Memory limits cap a runaway process so it cannot take the whole server down
+# (measured idle use is ~500 MiB for the stack; limits are ceilings, not
+# reservations). Every service also runs with no-new-privileges.
+#
 # Only Caddy is reachable from the internet (80/443, automatic HTTPS):
 #   https://$NEXUS_DOMAIN/            dashboard
 #   https://$NEXUS_DOMAIN/api/...     API (/api/v1/internal/* is not exposed)
@@ -18,6 +22,10 @@ name: nexus-prod
 x-logging: &logging
   driver: json-file
   options: { max-size: "10m", max-file: "5" }
+
+# Applied to every service: no privilege escalation through setuid binaries.
+x-security: &security
+  - no-new-privileges:true
 
 x-app-image: &app-image
   build:
@@ -81,7 +89,6 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-nexus}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./backups:/backups
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
@@ -91,6 +98,8 @@ services:
     stop_grace_period: 30s
     restart: unless-stopped
     logging: *logging
+    security_opt: *security
+    mem_limit: 1g
 
   rabbitmq:
     image: ${NEXUS_RABBITMQ_IMAGE:-rabbitmq:3.13-management-alpine}
@@ -111,9 +120,14 @@ services:
     stop_grace_period: 30s
     restart: unless-stopped
     logging: *logging
+    security_opt: *security
+    mem_limit: 768m
 
   redis:
     image: ${NEXUS_REDIS_IMAGE:-redis:7-alpine}
+    # The image only drops root by itself when the command is `redis-server`;
+    # this one goes through `sh` (to read the password from the environment).
+    user: redis
     command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASSWORD\" --appendonly yes --dir /data"]
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env.production}
@@ -127,6 +141,8 @@ services:
       retries: 20
     restart: unless-stopped
     logging: *logging
+    security_opt: *security
+    mem_limit: 256m
 
   migrate:
     <<: *app-image
@@ -137,6 +153,8 @@ services:
         condition: service_healthy
     restart: "no"
     logging: *logging
+    security_opt: *security
+    mem_limit: 512m
 
   api:
     <<: *app-image
@@ -152,6 +170,8 @@ services:
     stop_grace_period: 15s
     restart: unless-stopped
     logging: *logging
+    security_opt: *security
+    mem_limit: 512m
 
   scheduler:
     <<: *app-image
@@ -162,6 +182,8 @@ services:
     stop_grace_period: 20s
     restart: unless-stopped
     logging: *logging
+    security_opt: *security
+    mem_limit: 384m
 
   worker:
     <<: *app-image
@@ -178,6 +200,8 @@ services:
     stop_grace_period: 40s
     restart: unless-stopped
     logging: *logging
+    security_opt: *security
+    mem_limit: 768m
 
   dashboard:
     build:
@@ -187,6 +211,7 @@ services:
     image: nexus-dashboard:${NEXUS_VERSION:-latest}
     environment:
       NEXUS_API_PROXY: http://api:8000
+      NEXUS_ALLOWED_HOSTS: ${NEXUS_DOMAIN:?set NEXUS_DOMAIN in .env.production}
     depends_on:
       api:
         condition: service_healthy
@@ -198,6 +223,8 @@ services:
       start_period: 10s
     restart: unless-stopped
     logging: *logging
+    security_opt: *security
+    mem_limit: 384m
 
   caddy:
     image: ${NEXUS_CADDY_IMAGE:-caddy:2-alpine}
@@ -217,8 +244,17 @@ services:
         condition: service_healthy
       dashboard:
         condition: service_healthy
+    healthcheck:
+      # Caddy's admin API (container-local only) answers once the config loaded.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
     restart: unless-stopped
     logging: *logging
+    security_opt: *security
+    mem_limit: 256m
 
   prometheus:
     image: ${NEXUS_PROMETHEUS_IMAGE:-prom/prometheus:v3.5.0}
@@ -245,6 +281,8 @@ services:
       retries: 6
     restart: unless-stopped
     logging: *logging
+    security_opt: *security
+    mem_limit: 768m
 
   grafana:
     image: ${NEXUS_GRAFANA_IMAGE:-grafana/grafana:12.2.1}
@@ -273,6 +311,8 @@ services:
       start_period: 20s
     restart: unless-stopped
     logging: *logging
+    security_opt: *security
+    mem_limit: 512m
 
 configs:
   metrics_token:

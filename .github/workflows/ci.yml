@@ -204,6 +204,67 @@ jobs:
           echo dummy > /tmp/prom/token
           docker run --rm -v /tmp/prom:/w -w /w --entrypoint promtool prom/prometheus:v3.5.0 check config prometheus.yml
 
+  production-stack:
+    # The real production stack on the official images, deployed with the
+    # operations script exactly as on a server (domain "localhost": Caddy
+    # serves HTTPS from its internal CA instead of Let's Encrypt), then the
+    # smoke check and the destructive failure drills over HTTPS.
+    runs-on: ubuntu-latest
+    needs: production-config
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Configure (random secrets; test job types on for the drills)
+        run: |
+          deploy/production/nexus.sh init localhost ops@example.com > /dev/null
+          deploy/production/nexus.sh new-key drill > /tmp/key.txt
+          entry=$(grep -o 'drill:[0-9a-f]*' /tmp/key.txt)
+          sed -i "s|^API_KEYS=\(.*\)|API_KEYS=\1,$entry|; s|^TASK_ENABLE_TEST_HANDLERS=.*|TASK_ENABLE_TEST_HANDLERS=true|" .env.production
+          echo "::add-mask::$(grep -o 'nx_[0-9a-f]*' /tmp/key.txt)"
+          echo "NEXUS_E2E_API_KEY=$(grep -o 'nx_[0-9a-f]*' /tmp/key.txt)" >> "$GITHUB_ENV"
+
+      - name: Deploy
+        run: deploy/production/nexus.sh deploy
+
+      - name: Trust Caddy's local CA, smoke check over HTTPS
+        run: |
+          deploy/production/nexus.sh compose exec -T caddy cat /data/caddy/pki/authorities/local/root.crt > /tmp/caddy-root.crt
+          cat /etc/ssl/certs/ca-certificates.crt /tmp/caddy-root.crt > /tmp/bundle.crt
+          echo "CURL_CA_BUNDLE=/tmp/bundle.crt" >> "$GITHUB_ENV"
+          echo "SSL_CERT_FILE=/tmp/bundle.crt" >> "$GITHUB_ENV"
+          CURL_CA_BUNDLE=/tmp/bundle.crt deploy/production/nexus.sh smoke
+          deploy/production/nexus.sh status
+
+      - name: Failure drills (restart, kill, outage, stop/start)
+        env:
+          NEXUS_E2E_API_URL: https://localhost
+        run: uv run pytest -m resilience -v
+
+      - name: Backup and restore
+        run: |
+          deploy/production/nexus.sh backup
+          ls -l backups/
+          latest=$(find backups -name '*.dump' -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2)
+          deploy/production/nexus.sh restore "$latest"
+          curl -fsS https://localhost/api/v1/ready
+
+      - name: Logs on failure
+        if: failure()
+        run: deploy/production/nexus.sh compose logs --no-color --tail 200
+
+      - name: Tear down
+        if: always()
+        run: deploy/production/nexus.sh compose down -v || true
+
   compose-e2e:
     runs-on: ubuntu-latest
     needs: test

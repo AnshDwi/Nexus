@@ -72,38 +72,45 @@ cmd_init() {
 
 cmd_backup() {
   need_env
-  mkdir -p backups
-  local file label="${1:-manual}"
-  file="nexus-$(date -u +%Y%m%dT%H%M%SZ)-$label.dump"
+  local label="${1:-manual}" file tmp
+  [[ "$label" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid backup label"
+  # Backups hold every job payload: private directory, private files.
+  mkdir -p backups && chmod 700 backups
   if ! compose ps --status running postgres | grep -q postgres; then
     echo "postgres is not running; skipping backup"
     return 0
   fi
+  file="backups/nexus-$(date -u +%Y%m%dT%H%M%SZ)-$label.dump"
+  tmp="$file.partial"
+  # pg_dump runs inside the container (one consistent snapshot) and streams to
+  # a host file created with mode 600; nothing is written inside the container.
   # shellcheck disable=SC2016 # $POSTGRES_* expand inside the container
-  if ! compose exec -T postgres sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc -f "/backups/'"$file"'"' \
-      || [ ! -s "backups/$file" ]; then
-    rm -f "backups/$file"
+  if ! (umask 077 && compose exec -T postgres sh -c \
+        'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > "$tmp") \
+      || [ ! -s "$tmp" ]; then
+    rm -f "$tmp"
     die "backup failed; nothing was changed"
   fi
-  echo "backup: backups/$file ($(du -h "backups/$file" | cut -f1))"
+  mv "$tmp" "$file"
+  echo "backup: $file ($(du -h "$file" | cut -f1))"
 }
 
 cmd_restore() {
   need_env
   local file="${1:?usage: restore backups/<file>.dump}"
-  [ -s "$file" ] || die "$file not found or empty"
-  local name
-  name=$(basename "$file")
+  [ -f "$file" ] && [ -s "$file" ] || die "$file not found or empty"
   # shellcheck disable=SC2016 # $POSTGRES_* expand inside the container
-  compose exec -T postgres sh -c 'pg_restore --list "/backups/'"$name"'" >/dev/null' \
+  compose exec -T postgres pg_restore --list < "$file" > /dev/null \
     || die "$file is not a readable pg_dump archive; nothing was changed"
-  echo "Stopping API, scheduler and workers; restoring $name ..."
+  echo "Stopping API, scheduler and workers; restoring $(basename "$file") ..."
   compose stop api scheduler worker
   # Bring the services back whatever happens below.
   trap 'compose up -d --wait api scheduler worker >/dev/null' EXIT
   # shellcheck disable=SC2016 # $POSTGRES_* expand inside the container
-  compose exec -T postgres sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" pg_restore -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists --single-transaction "/backups/'"$name"'"'
-  echo "restored $name; restarting services"
+  compose exec -T postgres sh -c \
+    'PGPASSWORD="$POSTGRES_PASSWORD" pg_restore -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists --single-transaction' \
+    < "$file"
+  echo "restored $(basename "$file"); restarting services"
 }
 
 cmd_smoke() {
@@ -125,21 +132,46 @@ cmd_smoke() {
 cmd_deploy() {
   need_env
   [ "$(stat -c %a "$ENV_FILE")" = 600 ] || { chmod 600 "$ENV_FILE"; echo "fixed $ENV_FILE permissions (600)"; }
-  local version
+  local version previous free_gb
   version=$(git rev-parse --short HEAD)
+  previous=$(cat "$VERSION_FILE" 2>/dev/null || true)
+  free_gb=$(df -Pk . | awk 'NR==2 {print int($4/1048576)}')
+  [ "$free_gb" -ge 3 ] || die "only ${free_gb} GB free disk; need 3 GB to build and deploy safely"
   [ -z "$(git status --porcelain --untracked-files=no)" ] || echo "warning: uncommitted changes are included in $version"
   echo "== deploying $version"
   cmd_backup "before-$version"
   export NEXUS_VERSION="$version"
   compose build
-  echo "$version" > "$VERSION_FILE"
   # `up --wait` runs the one-shot migration first (every app service depends
   # on it) and returns only when every health check passes.
-  compose up -d --remove-orphans --wait --wait-timeout 300
+  if ! compose up -d --remove-orphans --wait --wait-timeout 300; then
+    echo "== deploy of $version FAILED" >&2
+    compose ps --format 'table {{.Service}}\t{{.Image}}\t{{.Status}}' >&2 || true
+    if [ -n "$previous" ] && docker image inspect "nexus-app:$previous" >/dev/null 2>&1; then
+      echo "== restoring the previous version $previous" >&2
+      NEXUS_VERSION="$previous" compose up -d --no-build --wait --wait-timeout 300 \
+        api scheduler worker dashboard >&2 || true
+    fi
+    die "deploy failed; see 'nexus.sh logs migrate' / 'nexus.sh logs api'. Still running: ${previous:-nothing}"
+  fi
+  echo "$version" > "$VERSION_FILE"
   echo "$(date -u +%FT%TZ) $version" >> "$HISTORY"
+  prune_images
   compose ps --format 'table {{.Service}}\t{{.Status}}'
   echo "== deployed $version"
   ( cmd_smoke ) || echo "warning: smoke check failed (DNS or certificate not ready yet?)"
+}
+
+# Keep the images of the last 3 deployed versions (for rollback); remove older ones.
+prune_images() {
+  local keep
+  keep=$(awk '{print $2}' "$HISTORY" | awk '!seen[$0]++' | tail -3 | tr '\n' ' ')
+  for repo in nexus-app nexus-dashboard; do
+    docker image ls "$repo" --format '{{.Tag}}' | while read -r tag; do
+      case " $keep " in *" $tag "*) ;; *) docker image rm "$repo:$tag" >/dev/null 2>&1 || true ;; esac
+    done
+  done
+  docker builder prune -f --filter until=168h >/dev/null 2>&1 || true
 }
 
 cmd_rollback() {

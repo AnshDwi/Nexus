@@ -85,9 +85,10 @@ Everything else — real execution, RabbitMQ, persistence, monitoring — runs w
 5. [Configuration](#configuration)
 6. [Monitoring](#monitoring)
 7. [Testing](#testing)
-8. [Deploying to Vercel](#deploying-to-vercel)
-9. [GitHub Pages demo](#github-pages-demo)
-10. [Known limitations](#known-limitations)
+8. [Production deployment](#production-deployment)
+9. [Deploying to Vercel](#deploying-to-vercel)
+10. [GitHub Pages demo](#github-pages-demo)
+11. [Known limitations](#known-limitations)
 
 ---
 
@@ -444,6 +445,33 @@ What the suites cover:
 CI (`.github/workflows/ci.yml`) runs all of the above, plus offline `vercel build`s of both projects. On `main` it then migrates the production database, deploys, and verifies the deployment end to end.
 
 ---
+
+## Production deployment
+
+The recommended production setup runs the whole real stack on one server, using [`compose.production.yml`](compose.production.yml):
+- Caddy with automatic HTTPS;
+- the API, scheduler and scaled workers;
+- PostgreSQL, RabbitMQ and Redis;
+- Prometheus and Grafana.
+
+A 2 vCPU / 4 GB VPS is enough: the stack idles at about 0.5 GB of RAM.
+
+```bash
+deploy/production/nexus.sh init nexus.example.com you@example.com   # .env.production with random secrets
+deploy/production/nexus.sh deploy                                   # backup, build, migrate, start, verify
+```
+
+[docs/PRODUCTION_DEPLOYMENT.md](docs/PRODUCTION_DEPLOYMENT.md) is a beginner-level guide. It covers:
+- a hosting comparison with costs;
+- server setup;
+- secrets;
+- migrations;
+- health checks;
+- backups and rollback;
+- troubleshooting;
+- the readiness checklist.
+
+The failure drills in `tests/e2e/test_production_resilience.py` (`-m resilience`) restart and kill real containers mid-job and verify that every job still finishes exactly once.
 
 ## Deploying to Vercel
 

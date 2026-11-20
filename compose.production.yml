@@ -1,0 +1,288 @@
+# NEXUS production stack for a single Docker host (VM).
+#
+#   cp deploy/production/env.example .env.production   # or: deploy/production/nexus.sh init
+#   deploy/production/nexus.sh deploy
+#
+# Standalone on purpose: nothing here inherits the development defaults of
+# docker-compose.yml. Every secret must come from .env.production; compose
+# refuses to start ("required variable ... is missing") if one is absent, and
+# the API refuses to start with default or published development credentials.
+#
+# Only Caddy is reachable from the internet (80/443, automatic HTTPS):
+#   https://$NEXUS_DOMAIN/            dashboard
+#   https://$NEXUS_DOMAIN/api/...     API (/api/v1/internal/* is not exposed)
+#   https://$NEXUS_DOMAIN/grafana/    Grafana (login required)
+# Prometheus and the RabbitMQ console listen on 127.0.0.1 only (SSH tunnel).
+name: nexus-prod
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "5" }
+
+x-app-image: &app-image
+  build:
+    context: .
+    args:
+      PYTHON_IMAGE: ${NEXUS_PYTHON_IMAGE:-python:3.12-slim}
+  image: nexus-app:${NEXUS_VERSION:-latest}
+
+x-app-env: &app-env
+  ENVIRONMENT: production
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: ${POSTGRES_USER:-nexus}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.production}
+  POSTGRES_DB: ${POSTGRES_DB:-nexus}
+  DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+  DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}
+  EVENT_BUS: rabbitmq
+  RABBITMQ_HOST: rabbitmq
+  RABBITMQ_PORT: "5672"
+  RABBITMQ_USER: ${RABBITMQ_USER:-nexus}
+  RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env.production}
+  REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env.production}@redis:6379/0
+  API_KEYS: ${API_KEYS:?set API_KEYS in .env.production (see deploy/production/nexus.sh new-key)}
+  CRON_SECRET: ${CRON_SECRET:?set CRON_SECRET in .env.production}
+  METRICS_TOKEN: ${METRICS_TOKEN:?set METRICS_TOKEN in .env.production}
+  CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+  TASK_ENABLE_TEST_HANDLERS: ${TASK_ENABLE_TEST_HANDLERS:-false}
+  WEBHOOK_ALLOWED_HOSTS: ${WEBHOOK_ALLOWED_HOSTS:-}
+  RATE_LIMIT_READS_PER_MINUTE: ${RATE_LIMIT_READS_PER_MINUTE:-600}
+  RATE_LIMIT_WRITES_PER_MINUTE: ${RATE_LIMIT_WRITES_PER_MINUTE:-120}
+  WORKER_HEARTBEAT_TTL_SECONDS: ${WORKER_HEARTBEAT_TTL_SECONDS:-30}
+  WORKER_HEARTBEAT_INTERVAL_SECONDS: ${WORKER_HEARTBEAT_INTERVAL_SECONDS:-5}
+  WORKER_SHUTDOWN_GRACE_SECONDS: ${WORKER_SHUTDOWN_GRACE_SECONDS:-25}
+  JOB_DEFAULT_TIMEOUT_SECONDS: ${JOB_DEFAULT_TIMEOUT_SECONDS:-60}
+  JOB_DEFAULT_MAX_ATTEMPTS: ${JOB_DEFAULT_MAX_ATTEMPTS:-3}
+  # Caddy is the only client of the API; trust its X-Forwarded-* headers.
+  FORWARDED_ALLOW_IPS: "*"
+
+x-daemon-health: &daemon-health
+  test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health', timeout=3)"]
+  interval: 10s
+  timeout: 5s
+  retries: 3
+  start_period: 20s
+
+x-app-deps: &app-deps
+  migrate:
+    condition: service_completed_successfully
+  rabbitmq:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+
+services:
+  postgres:
+    image: ${NEXUS_POSTGRES_IMAGE:-postgres:16-alpine}
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-nexus}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.production}
+      POSTGRES_DB: ${POSTGRES_DB:-nexus}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backups:/backups
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    stop_grace_period: 30s
+    restart: unless-stopped
+    logging: *logging
+
+  rabbitmq:
+    image: ${NEXUS_RABBITMQ_IMAGE:-rabbitmq:3.13-management-alpine}
+    hostname: nexus-rabbitmq # data is stored under the node name; keep it stable
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-nexus}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env.production}
+    ports:
+      - "127.0.0.1:15672:15672" # management UI: SSH tunnel only
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    stop_grace_period: 30s
+    restart: unless-stopped
+    logging: *logging
+
+  redis:
+    image: ${NEXUS_REDIS_IMAGE:-redis:7-alpine}
+    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASSWORD\" --appendonly yes --dir /data"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env.production}
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env.production}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+    logging: *logging
+
+  migrate:
+    <<: *app-image
+    command: ["alembic", "upgrade", "head"]
+    environment: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    logging: *logging
+
+  api:
+    <<: *app-image
+    environment: *app-env
+    depends_on: *app-deps
+    healthcheck:
+      # Readiness: answers 200 only when PostgreSQL, RabbitMQ and Redis respond.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/ready', timeout=4)"]
+      interval: 10s
+      timeout: 6s
+      retries: 6
+      start_period: 15s
+    stop_grace_period: 15s
+    restart: unless-stopped
+    logging: *logging
+
+  scheduler:
+    <<: *app-image
+    command: ["python", "-m", "nexus.daemon", "scheduler"]
+    environment: *app-env
+    depends_on: *app-deps
+    healthcheck: *daemon-health
+    stop_grace_period: 20s
+    restart: unless-stopped
+    logging: *logging
+
+  worker:
+    <<: *app-image
+    command: ["python", "-m", "nexus.daemon", "worker"]
+    environment:
+      <<: *app-env
+      WORKER_CAPACITY: ${WORKER_CAPACITY:-4}
+    deploy:
+      replicas: ${WORKER_REPLICAS:-2}
+    depends_on: *app-deps
+    healthcheck: *daemon-health
+    # Longer than WORKER_SHUTDOWN_GRACE_SECONDS: in-flight jobs finish or are
+    # handed back for retry before Docker would send SIGKILL.
+    stop_grace_period: 40s
+    restart: unless-stopped
+    logging: *logging
+
+  dashboard:
+    build:
+      context: ./frontend
+      args:
+        NODE_IMAGE: ${NEXUS_NODE_IMAGE:-node:22-alpine}
+    image: nexus-dashboard:${NEXUS_VERSION:-latest}
+    environment:
+      NEXUS_API_PROXY: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:5173/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+    logging: *logging
+
+  caddy:
+    image: ${NEXUS_CADDY_IMAGE:-caddy:2-alpine}
+    environment:
+      NEXUS_DOMAIN: ${NEXUS_DOMAIN:?set NEXUS_DOMAIN (e.g. nexus.example.com) in .env.production}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env.production}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/production/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+      dashboard:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *logging
+
+  prometheus:
+    image: ${NEXUS_PROMETHEUS_IMAGE:-prom/prometheus:v3.5.0}
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-15d}
+    configs:
+      - source: metrics_token
+        target: /run/secrets/metrics_token
+    volumes:
+      - ./deploy/production/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/observability/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090" # SSH tunnel only
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+    logging: *logging
+
+  grafana:
+    image: ${NEXUS_GRAFANA_IMAGE:-grafana/grafana:12.2.1}
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env.production}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: "%(protocol)s://%(domain)s/grafana/"
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/nexus.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./deploy/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/observability/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    restart: unless-stopped
+    logging: *logging
+
+configs:
+  metrics_token:
+    content: ${METRICS_TOKEN:?set METRICS_TOKEN in .env.production}
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
+  redis_data:
+  caddy_data:
+  caddy_config:
+  prometheus_data:
+  grafana_data:

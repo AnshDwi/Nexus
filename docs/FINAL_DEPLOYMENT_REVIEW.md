@@ -200,7 +200,22 @@ CPU use is a few percent of one core when idle. Images take about 4.3 GB on disk
 - Frontend: typecheck and lint clean; **50 tests passed** (6 demo-only tests skipped by design); **22 demo-mode tests passed**; normal and Pages builds OK; `npm audit` 0.
 - Tooling: `shellcheck`, `actionlint`, `caddy validate`, and both compose configs rendered.
 
-**GitHub Actions, official images:** see the PR #3 checks for this commit. They include the new `production-stack` job (production compose with the official PostgreSQL, RabbitMQ, Redis, Caddy, Prometheus and Grafana images, the 10 drills over HTTPS, and backup/restore) and `compose-e2e` (development stack, Grafana). The final result is recorded in the PR.
+**GitHub Actions, official images** (PR #3, commit `2c20d7e`, all 10 checks green). The **`production-stack`** job (5 min 21 s):
+- pulled the official `postgres:16-alpine`, `rabbitmq:3.13-management-alpine`, `redis:7-alpine`, `caddy:2-alpine`, `prom/prometheus:v3.5.0` and `grafana/grafana:12.2.1`;
+- deployed with `nexus.sh deploy`; **all 11 containers healthy, Grafana included**;
+- `nexus.sh smoke` over HTTPS: dashboard ok, internal endpoints hidden, **Grafana ok**;
+- **failure drills: 10 passed** (226 s);
+- backup: mode `-rw-------`, 40 KB; restore OK.
+
+The other checks:
+- `production-config`: compose renders and refuses without secrets; shellcheck; `caddy validate`; promtool;
+- `compose-e2e`: development stack, e2e tests, demo seed, Grafana provisioning, graceful shutdown;
+- `test`, `integration`, `frontend`, `vercel-build`;
+- the Pages workflow `build`.
+
+The deploy jobs were correctly skipped, since this isn't `main`.
+
+So the production stack has now run on **both** substitute images (locally) and the **official images** (GitHub Actions).
 
 **Not yet run anywhere:**
 - a real VPS;

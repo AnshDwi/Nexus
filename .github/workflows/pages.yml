@@ -117,7 +117,7 @@ jobs:
         env:
           URL: ${{ steps.deployment.outputs.page_url }}
         run: |
-          for i in $(seq 1 20); do
+          for _ in $(seq 1 20); do
             if curl -fsS "$URL" -o index.html && grep -q '/Nexus/assets/' index.html; then break; fi
             sleep 6
           done

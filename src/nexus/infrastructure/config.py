@@ -36,6 +36,9 @@ class DbPoolMode(StrEnum):
 
 _DEFAULT_PASSWORD = "nexus"  # noqa: S105 - local-only default, rejected outside local/test
 _LOCAL_ENVIRONMENTS = frozenset({"local", "test", "development"})
+# Published in README/.env.example for local use; never valid elsewhere.
+_PUBLIC_DEV_KEY_HASH = "7e9f8fd111802be56c379d597842e29b2cebd35ff2133d431a49fa556a18704e"  # dev-key
+_PUBLIC_DEV_SECRETS = frozenset({"local-cron-secret", "local-metrics-token"})
 # libpq query parameters asyncpg does not understand. sslmode is translated
 # into asyncpg's `ssl` connect argument instead of being passed through.
 _LIBPQ_ONLY_PARAMS = frozenset(
@@ -137,6 +140,15 @@ class Settings(BaseSettings):
     worker_heartbeat_interval_seconds: float = 5.0
     worker_forget_after_ttls: int = 20
     worker_capacity: int = 4
+    # Self-fencing: a worker stops executing (cancels handlers, stops
+    # consuming) once no heartbeat has succeeded for this long. Unset:
+    # TTL - max(2 x interval, 20% of TTL), i.e. 20 s for 30 s / 5 s. Must be
+    # >= 2 x interval and < TTL - interval, or the worker refuses to start.
+    worker_self_fence_after_seconds: float | None = None
+    # Exit the worker process (for the container to restart it) if a handler
+    # is still running TTL - interval after the last good heartbeat -- one
+    # that ignored cancellation, or blocked the event loop. See fail_stop.py.
+    worker_fail_stop: bool = True
     worker_shutdown_grace_seconds: float = 25.0
     job_redispatch_after_seconds: float = 900.0
     job_default_timeout_seconds: int = 60
@@ -185,6 +197,14 @@ class Settings(BaseSettings):
             problems.append("database credentials are the built-in defaults")
         if not self.api_keys.get_secret_value():
             problems.append("API_KEYS is empty")
+        elif _PUBLIC_DEV_KEY_HASH in self.api_keys.get_secret_value():
+            problems.append("API_KEYS contains the public development key (dev-key)")
+        for name, secret in (
+            ("CRON_SECRET", self.cron_secret),
+            ("METRICS_TOKEN", self.metrics_token),
+        ):
+            if secret is not None and secret.get_secret_value() in _PUBLIC_DEV_SECRETS:
+                problems.append(f"{name} is the public local default")
         if (
             self.event_bus is EventBus.RABBITMQ
             and self.rabbitmq_url_override is None

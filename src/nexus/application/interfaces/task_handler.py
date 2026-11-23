@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
@@ -11,6 +12,16 @@ class TaskContext:
     attempt: int
     max_attempts: int
     deadline: datetime | None
+    # Set by a self-fencing worker: True while this attempt may still act.
+    authority_check: Callable[[], bool] | None = None
+
+    def check_authority(self) -> None:
+        """Call right before an external side effect. Raises
+        AuthorityLostError if the worker has lost its authority for this
+        attempt (another worker may already be running it). A no-op where
+        the runtime does not track authority."""
+        if self.authority_check is not None and not self.authority_check():
+            raise AuthorityLostError(f"attempt {self.attempt} lost its execution authority")
 
     @property
     def idempotency_key(self) -> str:
@@ -18,6 +29,11 @@ class TaskContext:
         at-least-once, so handlers with external side effects should pass
         this to the systems they call."""
         return str(self.task_id)
+
+
+class AuthorityLostError(Exception):
+    """Raised by TaskContext.check_authority: the attempt must stop without
+    further side effects. The worker hands the attempt back for retry."""
 
 
 class PermanentTaskError(Exception):

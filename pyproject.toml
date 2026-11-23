@@ -41,10 +41,11 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "-m 'not integration and not e2e'"
+addopts = "-m 'not integration and not e2e and not resilience'"
 markers = [
     "integration: requires live infrastructure (Postgres/Redis/RabbitMQ) via docker compose; run explicitly with -m integration",
     "e2e: black-box tests against a running `docker compose` stack; run explicitly with -m e2e",
+    "resilience: DESTRUCTIVE failure drills against compose.production.yml (restarts/kills containers); run explicitly with -m resilience",
 ]
 
 [tool.ruff]

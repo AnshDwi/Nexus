@@ -17,6 +17,10 @@ class LeaseStatus:
     holder_id: UUID
     fencing_token: int
     expires_at: datetime
+    # True when this call made the caller leader (it held no live lease just
+    # before): a first acquisition, a takeover, or renewing its own lease
+    # after it had lapsed. Informational, like the transition metrics.
+    newly_acquired: bool = False
 
 
 def classify_transition(*, was_leader: bool, is_leader: bool) -> str | None:

@@ -1,0 +1,38 @@
+# Public entry point for compose.production.yml. Caddy obtains and renews the
+# TLS certificate for $NEXUS_DOMAIN automatically (ports 80 and 443 open, and
+# the domain's DNS A/AAAA record pointing at this server).
+{
+	email {$ACME_EMAIL}
+}
+
+{$NEXUS_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		-Server
+	}
+
+	# Maintenance and metrics endpoints are for the private network only
+	# (the scheduler and Prometheus reach the API directly). Caddy picks the
+	# most specific `handle` path, so this wins over /api/* below.
+	handle /api/v1/internal/* {
+		respond 404
+	}
+
+	handle /api/* {
+		reverse_proxy api:8000
+	}
+
+	handle /grafana/* {
+		reverse_proxy grafana:3000
+	}
+
+	handle {
+		header X-Frame-Options "DENY"
+		reverse_proxy dashboard:5173
+	}
+}

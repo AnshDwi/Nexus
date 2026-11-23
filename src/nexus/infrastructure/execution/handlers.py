@@ -59,6 +59,7 @@ class WebhookHandler:
             # SSRF guard: only explicitly allow-listed HTTPS hosts.
             raise PermanentTaskError(f"host '{host}' is not in WEBHOOK_ALLOWED_HOSTS or not https")
         body = payload.get("body", {})
+        context.check_authority()  # last moment before the side effect
         async with httpx.AsyncClient(timeout=self._timeout, follow_redirects=False) as client:
             response = await client.post(
                 url,

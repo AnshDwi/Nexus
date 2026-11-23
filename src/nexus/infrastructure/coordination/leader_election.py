@@ -1,5 +1,6 @@
 import logging
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta
 from uuid import UUID
 
@@ -60,6 +61,8 @@ class PostgresLeaderElection:
             was_leader = await self._was_leader_before(now)
             status = await self._acquire_or_renew(now)
             self._record_outcome(was_leader=was_leader, status=status)
+            if status.is_leader and not was_leader:
+                status = replace(status, newly_acquired=True)
             return status
         except Exception as exc:
             scheduler_lease_renewal_failures_total.labels(reason=type(exc).__name__).inc()

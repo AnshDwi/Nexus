@@ -270,7 +270,7 @@ They check:
 9. migrations are idempotent;
 10. logs are structured and traceable.
 
-Each job must finish **exactly once**.
+Each job must finish with **exactly one completed execution** recorded. (Handlers are at-least-once: an interrupted attempt may have run before it was retried.)
 
 ## 9. Updates, backups and rollback
 

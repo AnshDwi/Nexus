@@ -1,6 +1,18 @@
 # NEXUS roadmap
 
-Learning-focused engineering phases. Each one deepens a concept you can explain in an interview, and each has a concrete definition of done. Nothing here is started yet. They're ordered by value for learning; phase 1 is the recommended next step.
+Learning-focused engineering phases. Each one deepens a concept you can explain in an interview, and each has a concrete definition of done. They're ordered by value for learning; phase 1 is the recommended next step.
+
+## Done: execution-safety fixes (reliability remediation)
+
+Found by an audit, reproduced with failing drills first, then fixed (see README → *Reliability* and LEARNING_GUIDE §21):
+- **C1 / fix 1, scheduler observation window:** no dead-worker verdicts until the leader has watched heartbeats for a full TTL (`infrastructure/coordination/observation_window.py`).
+- **C1 / fix 2, worker self-fencing:** execution authority with sticky epochs, handler cancellation, hand-back, stranded-claim recovery, `TaskContext.check_authority()`, fail-stop watchdog (`execution_authority.py`, `fail_stop.py`, `rabbitmq_worker.py`, `job_executor.py`).
+- **C2, report retry:** a finished result is recorded through database blips instead of being re-run (`JobExecutor._report`).
+
+Not covered by these fixes (candidate follow-ups):
+- **Vercel job path** (`EVENT_BUS=vercel_queues`): Functions don't heartbeat, so there is no self-fencing; only lease expiry protects it.
+- **Tasks DAG pipeline** (`TaskExecutor`): attempt-guarded, but no self-fencing and no report retry.
+- **Cron maintenance endpoint** (`/internal/maintenance`): stateless, so no observation window; it sweeps dead workers immediately. A database-based window (for example, the leader's term start) would cover it.
 
 Ground rules for every phase:
 - **Write the failing test first.**
@@ -10,13 +22,29 @@ Ground rules for every phase:
 
 ---
 
-## Phase 1 — Reliability: exactly-once effects and data lifecycle
+## Outstanding issue H-1 — infrastructure failures consume the retry budget
+
+Not part of any phase yet; recorded so it is not forgotten.
+
+Every way an attempt can end without the handler itself failing is recorded as a failed attempt and counts against `max_attempts`:
+- graceful shutdown (`worker shut down before completion`);
+- dead-worker recovery by the scheduler (`stopped heartbeating`);
+- worker self-fencing hand-backs (`self-fenced`) and stranded-claim hand-backs;
+- lease expiry.
+
+So a job with `max_attempts=1` that happens to be running during a deploy, a PostgreSQL outage longer than the self-fencing deadline (20 s by default), or a worker crash is dead-lettered although its handler never failed. All of these go through `Job.fail` (`domain/job.py`); the execution row's status (`lost`, `timed_out`) already tells them apart.
+
+Direction (not decided): do not count `lost` attempts against `max_attempts`, or count them in a separate, capped counter so a job that keeps killing workers still stops. Keep real timeouts counting. Needs a migration only if a separate counter is stored.
+
+---
+
+## Phase 1 — Reliability: idempotent effects and data lifecycle
 
 **Objective.** Close the two gaps that the current design admits:
-- handler side effects can repeat (at-least-once execution);
+- handler side effects can repeat one after another (at-least-once execution; concurrent runs are already prevented by self-fencing);
 - history tables grow forever.
 
-**Why it matters.** "Can a job run twice?" is the first hard interview question. Today the honest answer is "the state machine is effectively-once, the handler is at-least-once". This phase lets you show the standard fix. Unbounded tables are the most common way a working system decays.
+**Why it matters.** "Can a job run twice?" is the first hard interview question. Today the honest answer is "state changes once; two attempts never run at the same time; but a handler can run again after a crash". This phase shows the standard way receivers make that harmless. Unbounded tables are the most common way a working system decays.
 
 **Concepts learned:**
 - idempotency keys for downstream calls;
@@ -26,18 +54,19 @@ Ground rules for every phase:
 - `VACUUM`/bloat;
 - an at-least-once vs exactly-once vocabulary.
 
+**Already in place:** handlers receive a stable key, `TaskContext.idempotency_key` (the job ID, the same for every attempt), and `http.webhook` sends it as `Idempotency-Key`. `JOB_REDISPATCH_AFTER_SECONDS` is configurable, and the `NexusOutboxLag` alert exists.
+
 **Features:**
-- Pass a stable idempotency key (`job_id:attempt` for "this attempt", or `job_id` for "this job") to handlers through `TaskContext`. The `http.webhook` handler sends it as an `Idempotency-Key` header.
-- A retention job in the scheduler pass deletes `job_executions` and `job_transitions` (and completed jobs) older than `RETENTION_DAYS`, in batches.
+- An example idempotent receiver (a small test service, or a `processed_keys` table for an internal handler) that drops repeats of the same key, to demonstrate the pattern end to end.
+- A retention job in the scheduler pass deletes `job_executions`, `job_transitions`, `inbox_records`, dispatched `outbox_records` (and completed jobs) older than `RETENTION_DAYS`, in batches.
 - Optional: partition `job_transitions` by month (Alembic migration).
-- Make the redispatch delay configurable per deployment, and alert on `nexus_outbox_lag_seconds`.
 
 **Tests:**
-- An integration test where a handler records calls in a table, the worker is killed after the side effect but before the report, and the side effect isn't duplicated (thanks to the key).
+- An integration test where a handler calls the example receiver, the worker is killed after the side effect but before the report, and the receiver records the effect once although the handler ran twice.
 - Retention: insert old rows, run a pass, assert they're deleted, recent ones kept, and nothing deleted for running jobs.
 
 **Definition of done:**
-- Killing a worker mid-webhook doesn't double-deliver to a receiver that honours the key, and this is verified by a test.
+- Killing a worker mid-webhook doesn't double-apply at a receiver that honours the key, and this is verified by a test.
 - With retention enabled, a 30-day-old history is pruned, and the metrics query time stays flat on a seeded 1M-row table (documented measurement).
 
 ## Phase 2 — Fair scheduling
@@ -62,7 +91,7 @@ Ground rules for every phase:
 
 **Tests:**
 - Unit: the cap decision.
-- Integration: tenant A submits 50 jobs, tenant B 5, with 2 workers × capacity 2. B's jobs start within N seconds, A never exceeds its cap, and every job completes exactly once.
+- Integration: tenant A submits 50 jobs, tenant B 5, with 2 workers × capacity 2. B's jobs start within N seconds, A never exceeds its cap, and every job finishes with one completed execution.
 
 **Definition of done:**
 - B's 95th-percentile wait time under A's flood is bounded and measured;

@@ -6,7 +6,7 @@ Review date: 20 Nov 2026 · Branch `production-readiness` (PR #3) · Reviewer: C
 
 **Verdict: READY WITH CONDITIONS** (section 12).
 
-The single-server production stack works as designed. Every job finished exactly once through:
+The single-server production stack works as designed. Every job finished, with exactly one completed execution recorded, through:
 - crashes and restarts of the API, scheduler and workers;
 - a broker outage, and database and Redis restarts;
 - a simulated server reboot;
@@ -77,15 +77,15 @@ Verified against the running stack, with a realistic domain over HTTPS:
 | Scenario | Status | Evidence |
 |---|---|---|
 | API crash (process killed) | ✅ Tested | Host `kill -9` of the API, scheduler and a worker: all auto-restarted and healthy in **6 s**; new jobs completed |
-| Worker crash | ✅ Tested | Drill: SIGKILL both workers → heartbeat timeout → jobs retried → completed exactly once |
+| Worker crash | ✅ Tested | Drill: SIGKILL both workers → heartbeat timeout → jobs retried → one completed execution each |
 | Scheduler crash | ✅ Tested | Killed with the API above; it restarted and reacquired leadership; jobs kept flowing |
-| API restart | ✅ Tested | Drill: 10 jobs, completed exactly once |
+| API restart | ✅ Tested | Drill: 10 jobs, one completed execution each |
 | PostgreSQL restart | ✅ Tested | Drill |
 | RabbitMQ restart / outage | ✅ Tested | Drill: jobs submitted **while RabbitMQ was stopped** stayed PENDING in the outbox, then ran once it returned |
 | Redis restart | ✅ Tested | Drill |
 | Graceful worker restart | ✅ Tested | Drill: unfinished work handed back, then retried |
 | Full stop/start | ✅ Tested | Drill: every job kept and completed |
-| Docker daemon restart (≈ reboot) | ✅ Tested | Daemon stopped and started: all 10 services back **healthy in 12 s** with no manual action; 3 in-flight jobs marked `lost`, retried, and completed exactly once |
+| Docker daemon restart (≈ reboot) | ✅ Tested | Daemon stopped and started: all 10 services back **healthy in 12 s** with no manual action; 3 in-flight jobs marked `lost`, retried, and completed (one completed execution each) |
 | Real VPS reboot | ⚠️ Assumed | Covered by the daemon test plus `restart: unless-stopped`, if Docker is enabled at boot (the `get.docker.com` install does that). Verify once on the server |
 | `docker kill` / `docker stop` | ℹ️ By design | Docker treats these as manual stops and won't restart the container until `nexus.sh deploy` or `compose up`. Use `docker restart`, not `kill`, by hand |
 | Failed migration / failed deploy | ✅ Tested | A deliberately failing migration: `deploy` exited 1, restored the previous version (healthy), left the recorded version unchanged; the schema stayed at the old head |
@@ -188,7 +188,7 @@ CPU use is a few percent of one core when idle. Images take about 4.3 GB on disk
   - HTTPS endpoint probe: dashboard and deep link 200; internal endpoints 404; no or bad key 401, valid 200; HSTS and the other headers present; TLS 1.3.
 - **Resilience drills: 10/10 passed over HTTPS** (282 s).
 - Crash via host `kill -9` (API, scheduler, worker): recovered in 6 s.
-- Docker daemon restart: recovered in 12 s; in-flight jobs completed exactly once.
+- Docker daemon restart: recovered in 12 s; in-flight jobs completed (one completed execution each).
 - Failed migration deploy: fallback worked.
 - Backup and restore: correct permissions; corrupt, empty, truncated and missing files refused; a restore failing partway rolled back and services were restarted.
 - Image pruning across 4 deploys: last 3 kept.

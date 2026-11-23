@@ -140,6 +140,15 @@ class Settings(BaseSettings):
     worker_heartbeat_interval_seconds: float = 5.0
     worker_forget_after_ttls: int = 20
     worker_capacity: int = 4
+    # Self-fencing: a worker stops executing (cancels handlers, stops
+    # consuming) once no heartbeat has succeeded for this long. Unset:
+    # TTL - max(2 x interval, 20% of TTL), i.e. 20 s for 30 s / 5 s. Must be
+    # >= 2 x interval and < TTL - interval, or the worker refuses to start.
+    worker_self_fence_after_seconds: float | None = None
+    # Exit the worker process (for the container to restart it) if a handler
+    # is still running TTL - interval after the last good heartbeat -- one
+    # that ignored cancellation, or blocked the event loop. See fail_stop.py.
+    worker_fail_stop: bool = True
     worker_shutdown_grace_seconds: float = 25.0
     job_redispatch_after_seconds: float = 900.0
     job_default_timeout_seconds: int = 60

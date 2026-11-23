@@ -72,6 +72,12 @@ scheduler_dead_workers_detected_total = Counter(
     "Workers found with a stale heartbeat by list_dead_workers.",
 )
 
+scheduler_dead_worker_sweeps_deferred_total = Counter(
+    "scheduler_dead_worker_sweeps_deferred_total",
+    "Maintenance passes that skipped the dead-worker sweep because the leader had not yet "
+    "watched heartbeats for a full TTL (after an outage, failed pass or leadership change).",
+)
+
 # Admission controller metrics.
 #
 # `failed_rule` is deliberately the *rule name* that failed, not the free-text
@@ -144,6 +150,19 @@ job_recoveries_total = Counter(
 rate_limited_requests_total = Counter(
     "nexus_rate_limited_requests_total", "Requests rejected by the rate limiter.", ["scope"]
 )
+worker_self_fences_total = Counter(
+    "nexus_worker_self_fences_total",
+    "Times a worker revoked its own execution authority and cancelled its running handlers.",
+    ["reason"],
+)
+
+worker_handbacks_total = Counter(
+    "nexus_worker_handbacks_total",
+    "Attempts a worker handed back after losing authority (recorded as lost, or already "
+    "recovered by the scheduler).",
+    ["result"],
+)
+
 dead_letter_pruned_total = Counter(
     "nexus_dead_letter_pruned_total",
     "Broker dead-letter messages removed because their job is no longer dead-lettered.",

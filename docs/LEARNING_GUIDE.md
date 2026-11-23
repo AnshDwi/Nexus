@@ -23,6 +23,7 @@ How NEXUS works, explained from the code. Every behaviour below names the file t
 18. Docker networking
 19. CI/CD workflow
 20. Debugging
+21. Who may run a job: observation window, self-fencing, fail-stop, report retry
 
 ---
 
@@ -153,7 +154,8 @@ Topology (`infrastructure/messaging/rabbitmq_topology.py`): `nexus.jobs` is a du
 
 1. **Start:**
    - registers in `worker_registrations` (id, capacity, capabilities);
-   - starts a heartbeat loop (every 5 s);
+   - starts a heartbeat loop (every 5 s). Each successful heartbeat extends the worker's **execution authority** (see §21);
+   - starts a fencing watchdog and, in the daemon, the fail-stop thread (§21);
    - sets `prefetch_count = capacity`, so RabbitMQ never gives it more unacknowledged messages than it can run;
    - consumes `nexus.jobs`.
 2. **For each message**, `_on_job_message` parses `{job_id, attempt}`. An unparseable message is rejected straight to the dead-letter queue. Otherwise it calls `JobExecutor.handle` (`infrastructure/execution/job_executor.py`).
@@ -161,8 +163,8 @@ Topology (`infrastructure/messaging/rabbitmq_topology.py`): `nexus.jobs` is a du
    1. insert an inbox row `job-executor:<message_id>`; if it already exists, the result is **DUPLICATE**, so ack and skip;
    2. lock the job row; if the attempt doesn't match or the state isn't dispatchable, the result is **STALE**, so ack and skip;
    3. otherwise `job.start(...)` → RUNNING, with `worker_id`, `started_at`, and a **lease** (`timeout + lease grace`). An execution row is created.
-4. **Run:** the handler from `handlers.py` runs inside `asyncio.wait_for(..., job.timeout_seconds)`.
-5. **Report:** `report_success` or `report_failure`, each guarded by `_live_attempt`, which checks that the job is still RUNNING with the same `attempt` **and** `worker_id`. A worker that was declared dead can't overwrite the retry's result; this is the fencing.
+4. **Run:** the handler from `handlers.py` runs in its own asyncio task inside `asyncio.wait_for(..., job.timeout_seconds)`, so the worker can cancel just the handler.
+5. **Report:** `report_success` or `report_failure`, each guarded by `_live_attempt`, which checks that the job is still RUNNING with the same `attempt` **and** `worker_id`. A worker that was declared dead can't overwrite the retry's result; this is the fencing. If PostgreSQL is briefly unreachable, `_report` keeps retrying (0.5 s doubling to 5 s) until the report commits, is rejected, or the attempt's lease deadline passes (§21).
 6. **Settle the message:**
    - `ack` when it completed, or failed with a retry scheduled (the retry is a *new* outbox message);
    - `reject` (→ dead-letter exchange) when the job ended FAILED;
@@ -171,9 +173,11 @@ Topology (`infrastructure/messaging/rabbitmq_topology.py`): `nexus.jobs` is a du
 **Graceful shutdown** (`stop()`):
 1. mark the worker draining;
 2. stop consuming;
-3. wait up to `WORKER_SHUTDOWN_GRACE_SECONDS` (25);
-4. hand unfinished attempts back with `JobExecutor.abandon` (execution `lost`, job RETRYING);
-5. deregister.
+3. wait up to `WORKER_SHUTDOWN_GRACE_SECONDS` (25) while **still heartbeating**, so running jobs keep their authority;
+4. cancel the handlers that are still running (only the handlers) and give their reports up to 5 s: they are recorded `lost` ("worker shut down before completion") and retried;
+5. last resort for anything still stuck: cancel it and hand it back with `JobExecutor.abandon`;
+6. stop the fail-stop thread, then the heartbeat;
+7. deregister, unless a hand-back could not be recorded (then the worker stays registered so the scheduler's sweep recovers those attempts).
 
 ## 10. How PostgreSQL stores job state
 
@@ -209,7 +213,7 @@ Redis holds **no job state**. If Redis is unreachable, the limiter falls back to
 **The maintenance pass:**
 1. **Leader election** (`infrastructure/coordination/leader_election.py`): one atomic `INSERT … ON CONFLICT DO UPDATE … WHERE` acquires or renews a 15-second lease. Each new term increments the **fencing token**. Only the leader continues.
 2. **Job recovery** (`_recover_jobs_fenced` → `recover_jobs`), in a transaction that re-checks the fencing token with `holds_lease` (`SELECT … FOR SHARE`), so a paused former leader can't commit:
-   - workers whose heartbeat is older than `WORKER_HEARTBEAT_TTL_SECONDS` (30) are dead: their RUNNING jobs fail (`lost`) and retry;
+   - workers whose heartbeat is older than `WORKER_HEARTBEAT_TTL_SECONDS` (30) are dead: their RUNNING jobs fail (`lost`) and retry. This step only runs once the leader's **observation window** spans a full TTL (§21); until then it is skipped and `scheduler_dead_worker_sweeps_deferred_total` goes up;
    - RUNNING jobs past their lease (`timeout + grace`) fail (`timed_out`) and retry;
    - jobs stuck PENDING, QUEUED or RETRYING without a dispatch for `JOB_REDISPATCH_AFTER_SECONDS` (900) get a new dispatch message (a lost broker message, for example).
 3. **Task reconciler** (`use_cases/reconcile_tasks.py`), for the DAG task feature: promotes tasks whose dependencies completed, cancels tasks blocked by a failed dependency, and expires leases.
@@ -220,7 +224,8 @@ Redis holds **no job state**. If Redis is unreachable, the limiter falls back to
 - **Backoff:** `retry_backoff` (`domain/task_lifecycle.py`) = `initial_backoff_seconds × 2^(attempt−1)`, capped at `max_backoff_seconds`.
 - **Scheduling the retry:** `Job.fail()` sets RETRYING, `attempt + 1`, and `next_attempt_at = now + backoff`. `_fail_running` (`use_cases/jobs.py`) then writes a new outbox message with `deliver_after = next_attempt_at`; the outbox stores it as `available_at` (`infrastructure/db/repositories/outbox_repository.py`).
 - **Holding it back:** the relay doesn't publish it until `available_at`, so the delay lives in PostgreSQL. No RabbitMQ delay plugin is needed, and the delay survives broker restarts.
-- **Permanent errors:** a handler raising `PermanentTaskError`, or a result that isn't JSON-serializable, is never retried.
+- **Permanent errors:** a handler raising `PermanentTaskError`, `TypeError` or `ValueError`, or returning a result that isn't JSON-serializable, is never retried.
+- **Interrupted attempts count too:** an attempt lost to a crash, a shutdown, self-fencing or lease expiry is recorded as a failed attempt and uses up one of `max_attempts` (issue H-1 in `docs/ROADMAP.md`).
 - **Manual retry:** `POST /jobs/{id}/retry` (`retry_job`) and `POST /jobs/bulk-retry` (`retry_jobs`, up to 100, with an optional error filter) work only on FAILED jobs.
 
 ## 14. Dead-letter queue
@@ -245,7 +250,7 @@ There are three layers, each for a different duplicate:
 2. **Duplicate deliveries.** RabbitMQ is at-least-once: a message can be redelivered after a connection drop, and the relay can republish if it crashes after the broker confirm but before its commit. Each message has a `message_id` (the outbox `event_id`); `claim_job` first inserts `inbox_records` key `job-executor:<message_id>`, and a second delivery is a no-op.
 3. **Stale messages.** A message names an `attempt`. If the job has moved on (retried, cancelled, already running), `claim_job` returns STALE. Results are accepted only from the live `attempt` + `worker_id`.
 
-**What isn't guaranteed:** *state transitions* happen once, but a *handler* can run more than once for the same job. Example: a worker runs a webhook, then dies before reporting; the scheduler retries; the webhook runs again (attempt 2). Handlers with external side effects should be idempotent themselves; that's normal for at-least-once systems.
+**What isn't guaranteed:** *state transitions* happen once, but a *handler* can run more than once for the same job. Example: a worker runs a webhook, then dies before reporting; the scheduler retries; the webhook runs again (attempt 2). Self-fencing (§21) makes sure two attempts never run **at the same time**, but it cannot undo a side effect that already happened. Handlers with external side effects should be idempotent: `TaskContext.idempotency_key` is the job ID, the same for every attempt, and `http.webhook` sends it as the `Idempotency-Key` header so the receiver can drop repeats. (A key that included the attempt number would be different on every retry and could not deduplicate anything.)
 
 ## 16. Monitoring and metrics
 
@@ -271,14 +276,17 @@ There are three layers, each for a different duplicate:
 |---|---|---|
 | API crashes | Committed jobs are safe; uncommitted requests get an error, and the client retries with the same `Idempotency-Key` | DB transactions, idempotency |
 | RabbitMQ down | API still accepts jobs (PENDING in the outbox); `/ready` → 503; jobs are published when it returns | Outbox + relay backoff |
-| PostgreSQL down | API requests fail (`/ready` → 503); workers can't claim, so they nack messages back to the queue; the daemons' health checks turn unhealthy (visible in `docker compose ps`). Docker restarts a container only if it *exits*, so the processes keep retrying and resume when the DB returns (verified by the PostgreSQL-restart drill) | Short transactions, requeue, retry loops |
+| PostgreSQL down, shorter than 20 s | API requests fail (`/ready` → 503); workers can't claim, so they nack messages back to the queue; a finished job's report keeps retrying and commits when the DB returns. Nothing is retried | Short transactions, requeue, report retry |
+| PostgreSQL down, longer than 20 s | Workers self-fence: running handlers are cancelled and handed back (`lost`, retried) when the DB returns. The scheduler waits a full TTL of observation before declaring anyone dead, so workers that come back are not swept. Docker restarts a container only if it *exits*, so the processes keep retrying and resume when the DB returns | Self-fencing, observation window |
+| One worker cut off from PostgreSQL | It fences at 20 s (cancels its handlers, stops consuming); the scheduler declares it dead at 30 s and retries the job elsewhere, so the two attempts never overlap | Self-fencing + heartbeat TTL |
 | Worker crashes mid-job | The unacked message returns to the queue. Another worker receives it, but `claim_job` finds its inbox key already recorded (→ DUPLICATE), so it doesn't run the job again. After 30 s without a heartbeat, the scheduler fails the attempt (`lost`) and dispatches a retry as a new message | Heartbeats, inbox, `recover_jobs`, fencing |
-| Job hangs | `asyncio.wait_for` timeout; if the whole worker hangs, lease expiry | Timeout + lease |
+| Claim committed but the worker saw an error | The redelivery is a DUPLICATE; the worker sees the job RUNNING under itself with no handler (a stranded claim) and hands it back | `JobExecutor._is_stranded` |
+| Job hangs | `asyncio.wait_for` timeout; if the handler ignores cancellation or blocks the event loop, the fail-stop thread exits the worker at 25 s; otherwise lease expiry | Timeout, fail-stop, lease |
 | Scheduler crashes | Another replica takes the lease after 15 s; a stale leader is fenced out | Leader lease + fencing token |
 | Redis down | Rate limiting falls back to in-process counters | `rate_limit.py` |
 | Broker message lost | Re-dispatched after 15 min | `stale_dispatch_for_update` |
 
-These scenarios are exercised by `tests/integration/test_job_pipeline_rabbitmq.py` and the production drills in `tests/e2e/test_production_resilience.py` (which restart and kill real containers).
+These scenarios are exercised by `tests/integration/test_job_pipeline_rabbitmq.py`, the self-fencing and reporting tests (`tests/integration/test_worker_self_fencing.py`, `test_job_executor_reporting.py`, `test_job_executor_recovery.py`, `test_dead_worker_observation_window.py`), the opt-in outage drills (`test_c1_postgres_outage_overlap.py`, `test_worker_self_fencing_drills.py`), and the production drills in `tests/e2e/test_production_resilience.py` (which restart and kill real containers).
 
 ## 18. Docker networking
 
@@ -322,3 +330,69 @@ These scenarios are exercised by `tests/integration/test_job_pipeline_rabbitmq.p
 6. **Stuck RUNNING?** Check `lease_expires_at` and the worker's `last_heartbeat_at`; the scheduler recovers it once the lease or heartbeat expires.
 7. **Metrics:** Grafana at :3000, or Prometheus at :9090 for queries such as `nexus_outbox_lag_seconds`.
 8. **Breakpoints:** run one component on the host instead of in Docker. Stop the container, then run the same command with `uv run` (for example `uv run python -m nexus.daemon worker`); `.env` points it at the containerized infrastructure on `localhost`.
+
+## 21. Who may run a job: observation window, self-fencing, fail-stop, report retry
+
+**The problem in one sentence.** The scheduler decides a worker is dead only from heartbeat rows in PostgreSQL, so when PostgreSQL is unreachable, a worker that is alive and busy can look dead. Its job is then retried on another worker while the first copy is still running. Fencing on `attempt` + `worker_id` keeps the *database* right, but both copies' side effects (for example two webhook calls) still happen. Four mechanisms close this.
+
+**1. The scheduler only judges what it could see** (`infrastructure/coordination/observation_window.py`, used by `infrastructure/execution/maintenance.py`).
+Think of a referee who looked away: he can't call a foul he didn't see. After any interruption, the leader starts a fresh window and skips the dead-worker step until the window is a full TTL (30 s) long.
+
+```
+pass fails / not leader / just became leader / gap > lease   →  window restarts
+each successful leader pass                                    →  window grows
+window ≥ TTL                                                   →  dead-worker sweep allowed
+(lease expiry, redispatch, relay: never wait)
+```
+
+**2. The worker knows when to stop** (`infrastructure/coordination/execution_authority.py`).
+The worker writes down when each heartbeat *started*. If none succeeds for `fence_after` (20 s), it assumes the scheduler may soon give its jobs away (at 30 s) and stops first. Because it measures from the start of the heartbeat, and the database records the heartbeat a little later, the worker's 20 s always ends before the scheduler's 30 s; the two clocks don't need to agree, they only need to tick at the same speed.
+
+**3. Epochs make "stopped" permanent** (`ExecutionAuthority.fence`).
+Each claim remembers the worker's epoch number. Fencing increases the epoch. An attempt from an old epoch can never finish as a success, even if the next heartbeat succeeds. New work after recovery gets the new epoch.
+
+**Self-fencing flow** (`infrastructure/messaging/rabbitmq_worker.py`, `infrastructure/execution/job_executor.py`):
+
+```
+heartbeat OK ─────────────► deadline = heartbeat start + 20 s
+deadline passes  (or heartbeat says "you are deregistered")
+  └─► fence: epoch + 1
+        ├─ cancel handlers of old-epoch attempts   (never a report in progress)
+        ├─ stop consuming; claim nothing new; report unhealthy
+        └─ each cancelled attempt → pending hand-back
+PostgreSQL reachable again, heartbeat OK
+  ├─ hand-backs recorded as `lost` → job RETRYING (no-op if the scheduler got there first)
+  └─ resume consuming under the new epoch
+```
+
+Two more rules:
+- **A result counts only if the handler finished in time.** If the handler finished while its attempt still had authority, the worker reports it, even if the report itself has to wait for PostgreSQL. If it finished after the fence, the attempt is handed back instead.
+- **`context.check_authority()`** raises `AuthorityLostError` once authority is gone. Call it right before an external side effect; `http.webhook` does.
+
+**4. Fail-stop for handlers that won't stop** (`infrastructure/coordination/fail_stop.py`).
+Cancelling only works if the handler gives control back to the event loop. A handler that swallows the cancellation, or blocks the loop with `time.sleep`, keeps going. A separate **thread** watches: if any handler is still alive 25 s (TTL − interval) after the last good heartbeat, it exits the process (code 70). Docker restarts the worker and the scheduler retries the job. The thread does nothing before the first heartbeat and is stopped before heartbeats stop at shutdown, so a clean shutdown never trips it.
+
+**Report retry (C2)** (`JobExecutor._report`).
+Earlier, the worker gave up recording a finished result after about 1.5 s, and the job ran again when its lease expired. Now it retries until the report commits, the database rejects it, or the attempt's lease deadline passes. Retrying is always safe: the report is a compare-and-set, so a late report either records a result nobody else has acted on, or is rejected. If a commit's reply was lost, the next try reads the job back to see whether it had in fact been recorded.
+
+**Timeline with the defaults** (heartbeat 5 s, TTL 30 s):
+
+| Time after the last good heartbeat | Worker | Scheduler |
+|---|---|---|
+| 0–20 s | Keeps working; reports retry through blips | Nothing |
+| 20 s | Fences: cancels handlers, stops consuming | Nothing |
+| 25 s | Fail-stop exits if a handler is still alive | Nothing |
+| 30 s (+ one tick) | — | Declares the worker dead (if its window is open) and retries the job |
+
+**What this does not do.**
+- It does not make side effects exactly-once: a crash after a side effect but before the report still re-runs the handler.
+- Interrupted attempts use up the retry budget (H-1).
+- It covers the RabbitMQ worker daemon only, not the Vercel job path, the tasks DAG pipeline or the cron maintenance endpoint.
+
+**Try it.**
+
+```bash
+NEXUS_C1_REPRO=1 scripts/test-integration.sh tests/integration/test_worker_self_fencing_drills.py -v -s -rs
+```
+
+Each drill prints when each attempt's handler started and ended, so you can see that they never overlap.

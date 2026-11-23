@@ -111,3 +111,17 @@ def test_daemon_only_publishes_when_it_can_name_the_push_partition(monkeypatch):
     monkeypatch.setenv("EVENT_BUS", "rabbitmq")
     monkeypatch.setenv("RABBITMQ_URL", "amqps://u:p@broker.example.com/vhost")
     assert can_publish_to_push_consumers(_settings(api_keys=_KEY)) is True
+
+
+def test_production_rejects_published_development_secrets(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@db.example.com/db")
+    monkeypatch.setenv("RABBITMQ_URL", "amqps://u:p@broker.example.com/vhost")
+    dev_key = "dev:7e9f8fd111802be56c379d597842e29b2cebd35ff2133d431a49fa556a18704e"
+    with pytest.raises(ValidationError, match="public development key"):
+        _settings(environment="production", api_keys=f"{_KEY},{dev_key}")
+    with pytest.raises(ValidationError, match="CRON_SECRET is the public local default"):
+        _settings(environment="production", api_keys=_KEY, CRON_SECRET="local-cron-secret")
+    with pytest.raises(ValidationError, match="METRICS_TOKEN is the public local default"):
+        _settings(environment="production", api_keys=_KEY, metrics_token="local-metrics-token")
+    # The same values stay valid for local development.
+    assert _settings(api_keys=dev_key, CRON_SECRET="local-cron-secret").is_local

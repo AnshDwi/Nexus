@@ -21,7 +21,14 @@ export default defineConfig(({ mode }) => {
   define: { __NEXUS_DEMO__: JSON.stringify(env.VITE_DEMO_MODE === 'true') },
   plugins: [react(), tailwindcss()],
   server: { port: 5173, proxy: apiProxy },
-  preview: { port: 5173, proxy: apiProxy },
+  // `vite preview` (the Docker image) rejects unknown Host headers. Behind a
+  // reverse proxy on a real domain, list it in NEXUS_ALLOWED_HOSTS
+  // (compose.production.yml sets it from NEXUS_DOMAIN).
+  preview: {
+    port: 5173,
+    proxy: apiProxy,
+    allowedHosts: (process.env.NEXUS_ALLOWED_HOSTS ?? '').split(',').map((h) => h.trim()).filter(Boolean),
+  },
   test: {
     environment: 'jsdom',
     setupFiles: ['./src/test/setup.ts'],

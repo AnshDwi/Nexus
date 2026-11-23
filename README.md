@@ -21,6 +21,17 @@ Dashboard (React) ──► API (FastAPI) ──► PostgreSQL ◄────�
                   relay retries · dead-worker detection · lease expiry
 ```
 
+## Documentation
+
+| Guide | For |
+|---|---|
+| [Local development](docs/LOCAL_DEVELOPMENT.md) | Starting, stopping, resetting, testing and debugging on your machine |
+| [Learning guide](docs/LEARNING_GUIDE.md) | How NEXUS works, from the code: request and job lifecycles, outbox, inbox, retries, DLQ, scheduler, failure recovery |
+| [Interview guide](docs/INTERVIEW_GUIDE.md) | Questions and answers grounded in the implementation, with limitations and trade-offs |
+| [Roadmap](docs/ROADMAP.md) | Next engineering phases: reliability, fair scheduling, DAGs, observability, performance, security, DX |
+| [Production deployment](docs/PRODUCTION_DEPLOYMENT.md) · [review](docs/FINAL_DEPLOYMENT_REVIEW.md) | Optional: running the real stack on a server (kept as a learning resource) |
+| [GitHub Pages demo](docs/github-pages-demo.md) | The static, simulated dashboard demo |
+
 ## Live demo
 
 > **Status: not deployed yet.** The [Pages workflow](.github/workflows/pages.yml) publishes the demo to `https://anshdwi.github.io/Nexus/` once GitHub Pages is enabled (**Settings → Pages → Source: GitHub Actions**) and the change is merged into `main`. This line will link to the live site after the first verified deployment.
@@ -85,9 +96,10 @@ Everything else — real execution, RabbitMQ, persistence, monitoring — runs w
 5. [Configuration](#configuration)
 6. [Monitoring](#monitoring)
 7. [Testing](#testing)
-8. [Deploying to Vercel](#deploying-to-vercel)
-9. [GitHub Pages demo](#github-pages-demo)
-10. [Known limitations](#known-limitations)
+8. [Production deployment](#production-deployment)
+9. [Deploying to Vercel](#deploying-to-vercel)
+10. [GitHub Pages demo](#github-pages-demo)
+11. [Known limitations](#known-limitations)
 
 ---
 
@@ -98,11 +110,13 @@ Everything else — real execution, RabbitMQ, persistence, monitoring — runs w
 Requires only Docker with Compose v2. Nothing else needs to be installed or running.
 
 ```bash
-git clone <repo-url> nexus && cd nexus
-cp .env.example .env            # optional: compose has working local defaults
+git clone https://github.com/AnshDwi/Nexus.git && cd Nexus
+cp .env.example .env            # optional: local defaults; also turns on Prometheus + Grafana
 docker compose up --build -d --wait
 docker compose ps               # every service healthy; migrate "exited (0)"
 ```
+
+Open the dashboard at http://localhost:5173 (API key `dev-key`). The API docs are at http://localhost:8000/api/docs. With `.env` copied, Grafana is at http://localhost:3000 and Prometheus at http://localhost:9090, because `.env.example` sets `COMPOSE_PROFILES=observability`.
 
 `--wait` returns once every health check passes. That takes about 20 s with cached images, and longer on the first build.
 
@@ -168,9 +182,13 @@ You can run it repeatedly; each run uses fresh idempotency keys.
 **Stop and reset:**
 
 ```bash
-docker compose down        # stop; data in the volumes is kept
-docker compose down -v     # stop and delete all data
+docker compose --profile "*" down    # stop everything (incl. monitoring/demo); data is kept
+scripts/reset-local.sh               # asks for confirmation, then deletes all local data
 ```
+
+`--profile "*"` matters: a plain `docker compose down` skips services started under a profile (Prometheus, Grafana), which keep running.
+
+[docs/LOCAL_DEVELOPMENT.md](docs/LOCAL_DEVELOPMENT.md) has every everyday command (logs, restarts, consoles, tests, hot-reload frontend, migrations) and troubleshooting.
 
 `docker compose stop` sends SIGTERM. Workers drain: they stop consuming, let in-flight jobs finish within `WORKER_SHUTDOWN_GRACE_SECONDS`, hand unfinished attempts back as RETRYING and deregister. Each worker's `stop_grace_period` is longer than that grace.
 
@@ -353,7 +371,7 @@ Logs are JSON lines carrying `request_id`, `correlation_id`, `job_id` and `attem
 ## Monitoring
 
 ```bash
-docker compose --profile observability up -d
+docker compose --profile observability up -d   # already included if you copied .env.example
 ```
 
 - **Prometheus** at http://localhost:9090, with the alert rules loaded.
@@ -444,6 +462,33 @@ What the suites cover:
 CI (`.github/workflows/ci.yml`) runs all of the above, plus offline `vercel build`s of both projects. On `main` it then migrates the production database, deploys, and verifies the deployment end to end.
 
 ---
+
+## Production deployment
+
+The recommended production setup runs the whole real stack on one server, using [`compose.production.yml`](compose.production.yml):
+- Caddy with automatic HTTPS;
+- the API, scheduler and scaled workers;
+- PostgreSQL, RabbitMQ and Redis;
+- Prometheus and Grafana.
+
+A 2 vCPU / 4 GB VPS is enough: the stack idles at about 0.5 GB of RAM.
+
+```bash
+deploy/production/nexus.sh init nexus.example.com you@example.com   # .env.production with random secrets
+deploy/production/nexus.sh deploy                                   # backup, build, migrate, start, verify
+```
+
+[docs/PRODUCTION_DEPLOYMENT.md](docs/PRODUCTION_DEPLOYMENT.md) is a beginner-level guide. It covers:
+- a hosting comparison with costs;
+- server setup;
+- secrets;
+- migrations;
+- health checks;
+- backups and rollback;
+- troubleshooting;
+- the readiness checklist.
+
+The failure drills in `tests/e2e/test_production_resilience.py` (`-m resilience`) restart and kill real containers mid-job and verify that every job still finishes exactly once.
 
 ## Deploying to Vercel
 

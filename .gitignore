@@ -16,3 +16,9 @@ _vc_queue_handlers/
 
 # Logs
 *.log
+
+# Production secrets and state (deploy/production/nexus.sh)
+.env.production
+.deploy-history
+.nexus-version
+backups/

@@ -21,6 +21,7 @@ from nexus.application.use_cases.jobs import RecoveryReport, recover_jobs
 from nexus.application.use_cases.reconcile_tasks import ReconcileReport, reconcile_tasks
 from nexus.infrastructure.config import Settings
 from nexus.infrastructure.coordination.leader_election import PostgresLeaderElection
+from nexus.infrastructure.coordination.observation_window import HeartbeatObservationWindow
 from nexus.infrastructure.coordination.worker_registry import PostgresWorkerRegistry
 from nexus.infrastructure.db.repositories.job_repository import PostgresJobStore
 from nexus.infrastructure.db.repositories.outbox_repository import PostgresOutboxWriter
@@ -30,6 +31,7 @@ from nexus.infrastructure.observability.metrics import (
     job_recoveries_total,
     outbox_relayed_total,
     reconciler_repairs_total,
+    scheduler_dead_worker_sweeps_deferred_total,
 )
 
 logger = logging.getLogger("nexus.maintenance")
@@ -46,6 +48,9 @@ class MaintenanceReport:
     jobs: RecoveryReport = RecoveryReport()
     dead_workers: int = 0
     fenced_out: bool = False
+    # The leader skipped the dead-worker sweep this pass: it had not yet
+    # watched heartbeats for a full TTL (see observation_window.py).
+    dead_worker_sweep_deferred: bool = False
 
 
 async def _recover_jobs_fenced(
@@ -54,10 +59,13 @@ async def _recover_jobs_fenced(
     *,
     replica_id: UUID,
     fencing_token: int,
+    sweep_dead_workers: bool = True,
 ) -> tuple[RecoveryReport, int, bool]:
     """Dead-worker detection and job recovery, committed only under the
     fencing token this replica was granted. Returns (report, dead workers,
-    fenced_out)."""
+    fenced_out). With `sweep_dead_workers=False` no worker is treated as
+    dead (or forgotten) this pass; expired leases and stale dispatches are
+    still recovered."""
     lease_duration = timedelta(seconds=settings.scheduler_lease_duration_seconds)
     ttl = timedelta(seconds=settings.worker_heartbeat_ttl_seconds)
     async with session_factory() as session:
@@ -72,7 +80,7 @@ async def _recover_jobs_fenced(
             logger.warning("fenced out: lease lost before recovery", extra={"token": fencing_token})
             return RecoveryReport(), 0, True
         registry = PostgresWorkerRegistry(session)
-        dead = await registry.list_dead_workers(ttl)
+        dead = await registry.list_dead_workers(ttl) if sweep_dead_workers else []
         report = await recover_jobs(
             PostgresJobStore(session),
             PostgresOutboxWriter(session),
@@ -82,9 +90,10 @@ async def _recover_jobs_fenced(
         )
         # Forget workers that have been silent for a long time and own no
         # running jobs any more (their jobs were just recovered).
-        forget_after = ttl * settings.worker_forget_after_ttls
-        for worker in await registry.list_dead_workers(forget_after):
-            await registry.deregister(worker.worker_id)
+        if sweep_dead_workers:
+            forget_after = ttl * settings.worker_forget_after_ttls
+            for worker in await registry.list_dead_workers(forget_after):
+                await registry.deregister(worker.worker_id)
         await session.commit()
     for kind, count in (
         ("dead_worker", report.lost_on_dead_workers),
@@ -104,6 +113,38 @@ async def run_maintenance_pass(
     replica_id: UUID,
     trigger: str,
     relay: bool = True,
+    observation: HeartbeatObservationWindow | None = None,
+) -> MaintenanceReport:
+    """One pass. `observation` is the long-running scheduler's heartbeat
+    observation window: when given, the dead-worker sweep waits until this
+    replica has led, with working database access, for a full heartbeat TTL,
+    and any failure resets it. Without one (the stateless cron endpoint),
+    the sweep runs every pass as before."""
+    try:
+        return await _maintenance_pass(
+            session_factory,
+            publisher,
+            settings,
+            replica_id=replica_id,
+            trigger=trigger,
+            relay=relay,
+            observation=observation,
+        )
+    except Exception:
+        if observation is not None:
+            observation.reset("maintenance pass failed")
+        raise
+
+
+async def _maintenance_pass(
+    session_factory: async_sessionmaker[AsyncSession],
+    publisher: EventPublisher | None,
+    settings: Settings,
+    *,
+    replica_id: UUID,
+    trigger: str,
+    relay: bool,
+    observation: HeartbeatObservationWindow | None,
 ) -> MaintenanceReport:
     async with session_factory() as session:
         election = PostgresLeaderElection(
@@ -116,20 +157,44 @@ async def run_maintenance_pass(
         await session.commit()
 
     if not status.is_leader:
+        if observation is not None:
+            observation.reset("not the leader")
         return MaintenanceReport(
             leader=False, fencing_token=None, reconcile=ReconcileReport(), relayed=0
         )
 
+    sweep_dead_workers = True
+    if observation is not None:
+        observation.begin_leader_pass(newly_acquired=status.newly_acquired)
+        sweep_dead_workers = observation.allows_dead_worker_sweep
+        if not sweep_dead_workers:
+            scheduler_dead_worker_sweeps_deferred_total.inc()
+            logger.info(
+                "dead-worker sweep deferred until heartbeats were observable for a full TTL",
+                extra={
+                    "observed_seconds": round(observation.observed_seconds, 1),
+                    "ttl_seconds": settings.worker_heartbeat_ttl_seconds,
+                    "since": observation.last_reset_reason,
+                },
+            )
+
     jobs_report, dead_workers, fenced_out = await _recover_jobs_fenced(
-        session_factory, settings, replica_id=replica_id, fencing_token=status.fencing_token
+        session_factory,
+        settings,
+        replica_id=replica_id,
+        fencing_token=status.fencing_token,
+        sweep_dead_workers=sweep_dead_workers,
     )
     if fenced_out:
+        if observation is not None:
+            observation.reset("fenced out")
         return MaintenanceReport(
             leader=False,
             fencing_token=status.fencing_token,
             reconcile=ReconcileReport(),
             relayed=0,
             fenced_out=True,
+            dead_worker_sweep_deferred=not sweep_dead_workers,
         )
 
     async with session_factory() as session:
@@ -174,4 +239,5 @@ async def run_maintenance_pass(
         relayed=relayed,
         jobs=jobs_report,
         dead_workers=dead_workers,
+        dead_worker_sweep_deferred=not sweep_dead_workers,
     )

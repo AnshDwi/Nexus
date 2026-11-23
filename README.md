@@ -26,7 +26,7 @@ Dashboard (React) ──► API (FastAPI) ──► PostgreSQL ◄────�
 | Guide | For |
 |---|---|
 | [Local development](docs/LOCAL_DEVELOPMENT.md) | Starting, stopping, resetting, testing and debugging on your machine |
-| [Learning guide](docs/LEARNING_GUIDE.md) | How NEXUS works, from the code: request and job lifecycles, outbox, inbox, retries, DLQ, scheduler, failure recovery |
+| [Learning guide](docs/LEARNING_GUIDE.md) | How NEXUS works, from the code: request and job lifecycles, outbox, inbox, retries, DLQ, scheduler, failure recovery, self-fencing |
 | [Interview guide](docs/INTERVIEW_GUIDE.md) | Questions and answers grounded in the implementation, with limitations and trade-offs |
 | [Roadmap](docs/ROADMAP.md) | Next engineering phases: reliability, fair scheduling, DAGs, observability, performance, security, DX |
 | [Production deployment](docs/PRODUCTION_DEPLOYMENT.md) · [review](docs/FINAL_DEPLOYMENT_REVIEW.md) | Optional: running the real stack on a server (kept as a learning resource) |
@@ -91,7 +91,7 @@ Everything else — real execution, RabbitMQ, persistence, monitoring — runs w
 
 1. [Quick start](#quick-start)
 2. [Job lifecycle](#job-lifecycle)
-3. [Architecture](#architecture)
+3. [Architecture](#architecture) · [Reliability](#reliability-who-may-run-an-attempt-and-when)
 4. [API reference](#api-reference)
 5. [Configuration](#configuration)
 6. [Monitoring](#monitoring)
@@ -227,12 +227,16 @@ PENDING ──► QUEUED ──► RUNNING ──► COMPLETED
 | QUEUED only after the broker accepted the message | Relay publishes with **publisher confirms** and `mandatory` routing; QUEUED is written in the same transaction that observed the confirm |
 | Retries are delayed | FAILED → RETRYING writes a dispatch held back until `next_attempt_at` (exponential backoff, capped) |
 | Each delivery runs at most once | Inbox record per message (`job-executor:{message_id}`) + attempt check |
-| Stale workers cannot change state | Results accepted only from the worker holding the live attempt (`attempt` + `worker_id` fence) |
+| Stale workers cannot change state | Results accepted only from the worker holding the live attempt (`attempt` + `worker_id` compare-and-set under the job's row lock) |
 | Stale leaders cannot change state | Scheduler writes run under a `FOR SHARE` check of its lease **fencing token** |
-| Dead workers' jobs are retried | Heartbeat TTL → scheduler fails and retries their RUNNING jobs |
+| Dead workers' jobs are retried | Heartbeat TTL → scheduler fails and retries their RUNNING jobs, but only once the leader has watched heartbeats for a full TTL (**observation window**) |
+| A cut-off worker stops before its job is retried elsewhere | **Self-fencing**: no successful heartbeat for 20 s → cancel handlers, stop consuming, hand attempts back; **fail-stop** exits the process if a handler won't stop |
+| A finished result survives a database blip | **Report retry** until it commits, the database rejects it, or the attempt's lease deadline passes |
 | Hung jobs are retried | Execution lease = timeout + grace; expiry → FAILED → RETRYING |
-| Final failures are dead-lettered | Job FAILED with `dead_lettered_at`; message rejected to `nexus.dead-letter` |
-| Graceful shutdown | SIGTERM: draining, stop consuming, finish in-flight work (grace period), hand unfinished attempts back, deregister |
+| Final failures are dead-lettered | Job FAILED with `dead_lettered_at`; message rejected to `nexus.dead-letter` when the worker reports the final failure |
+| Graceful shutdown | SIGTERM: draining, stop consuming, keep heartbeating while in-flight work finishes (grace period), cancel unfinished handlers and report them `lost` (retried), deregister |
+
+**Delivery guarantee.** Job *state* changes happen once per attempt. Job *handlers* run **at least once**: a worker that crashes after a side effect but before its result is recorded causes a re-run. NEXUS does not provide exactly-once external side effects; handlers receive a stable idempotency key (`TaskContext.idempotency_key`, the job ID, sent by `http.webhook` as `Idempotency-Key`) so receivers can deduplicate.
 
 ---
 
@@ -262,14 +266,49 @@ Design records:
 - [ADR 0004: Vercel-first execution](docs/adr/0004-vercel-first-execution.md)
 - [ADR 0005: Job pipeline over RabbitMQ](docs/adr/0005-job-pipeline-rabbitmq.md)
 
+### Reliability: who may run an attempt, and when
+
+Two processes can disagree about whether a worker is alive: the scheduler, which sees only heartbeat rows in PostgreSQL, and the worker, which knows its handlers are running. Four mechanisms keep them from both acting on the same attempt. The database stays the final authority throughout: every result is a compare-and-set on `(state RUNNING, attempt, worker_id)` under the job's row lock (`_live_attempt` in `application/use_cases/jobs.py`).
+
+**Scheduler observation window** (`infrastructure/coordination/observation_window.py`). A worker is declared dead when its heartbeat is older than `WORKER_HEARTBEAT_TTL_SECONDS`, but that only proves something if heartbeats *could* have been written and read meanwhile. After a PostgreSQL outage every heartbeat looks stale. So the leader skips the dead-worker sweep until it has itself had uninterrupted database access, as the leader, for a full TTL. The window restarts after a failed maintenance pass, when the replica is not (or no longer) the leader, when it (re)acquires leadership (including renewing its own lapsed lease), and when two passes are further apart than the leader lease. Lease-expiry recovery, redispatch, task reconciliation and the relay are never delayed. The stateless cron endpoint passes no window and sweeps as before.
+
+**Worker execution authority and sticky epochs** (`infrastructure/coordination/execution_authority.py`). Each worker computes its own deadline: *start of its last successful heartbeat + `fence_after`* (20 s by default, always less than TTL − heartbeat interval). Because the start time is taken before the heartbeat statement and the database stamps `last_heartbeat_at` later, the worker's deadline always falls before the scheduler could declare it dead; no clock synchronisation is needed. Every claim is stamped with the worker's current **epoch**. Fencing increments the epoch, and attempts from an older epoch never regain authority, even if a later heartbeat succeeds (**sticky fencing**). A heartbeat that only succeeds after the deadline fences first.
+
+**Self-fencing** (`infrastructure/messaging/rabbitmq_worker.py`, `infrastructure/execution/job_executor.py`). When the deadline passes, or a heartbeat finds the worker deregistered, the worker:
+1. cancels the handlers of attempts from the old epoch (only the handler; a report in progress is never cancelled);
+2. stops consuming (prefetched messages return to the queue) and reports unhealthy;
+3. claims nothing new: no claim is attempted without authority, and an attempt whose authority was lost while its claim was in flight never starts;
+4. **hands the attempts back** as soon as PostgreSQL accepts it: recorded as `lost` and retried per the job's policy. It is a compare-and-set too, so a no-op if the scheduler already recovered the job;
+5. resumes consuming after its next successful heartbeat, under a new epoch.
+
+An outcome is reported only if its handler finished while the attempt still had authority. Results produced in time are still recorded after a delay: the compare-and-set alone decides whether they are wanted. Handlers can call `TaskContext.check_authority()` right before a side effect; `http.webhook` does so before its POST. A redelivered message whose claim had committed although the worker saw an error (a **stranded claim**: RUNNING under this worker, no handler) is handed back too.
+
+**Fail-stop watchdog** (`infrastructure/coordination/fail_stop.py`). Cancellation only stops handlers that yield to the event loop. A thread (so a blocked event loop cannot stop it) exits the process with code 70 if any handler is still alive TTL − interval (25 s) after the last good heartbeat. Docker restarts the worker, messages return to the queue, and the scheduler recovers the jobs. It is inert before the first heartbeat and stopped before heartbeats stop at shutdown. On by default in the daemon (`WORKER_FAIL_STOP`).
+
+**Report retry (C2)** (`JobExecutor._report`). Recording an outcome is retried with backoff (0.5 s doubling to 5 s) until it commits, the database rejects it (fenced), or the attempt's lease deadline (claim start + timeout + grace) passes. Retrying is safe because every report is a compare-and-set. A commit whose reply was lost is read back, so a recorded result is not mistaken for a fenced one.
+
+**Failure recovery lifecycle** (defaults: heartbeat 5 s, TTL 30 s, `fence_after` 20 s, fail-stop 25 s):
+
+| Situation | Worker | Scheduler | Outcome |
+|---|---|---|---|
+| Worker crashes | Gone | After TTL (once its window is open): attempt `lost`, retry dispatched | Retried elsewhere |
+| Worker cut off from PostgreSQL, others fine | At 20 s: cancels handlers, stops consuming | At 30 s: declares it dead, retries the job | Attempts run one after another, never at the same time |
+| Everyone loses PostgreSQL > 20 s | Fences, cancels handlers; hands back when PostgreSQL returns | Waits a full TTL of observation before sweeping | Interrupted attempts retried; no false "dead" verdicts |
+| PostgreSQL blip < 20 s | Nothing; a pending report retries until it commits | Nothing | No retry, no re-run |
+| Handler ignores cancellation / blocks the loop | Fail-stop exits at 25 s | Recovers after TTL | Retried elsewhere |
+| Worker deregistered while running | Fences immediately, hands back, re-registers | — | Retried |
+| Graceful shutdown | Drains (heartbeating), then cancels handlers, reports `lost` | — | Retried |
+
+Interrupted attempts count against `max_attempts` (see H-1 under [Known limitations](#known-limitations)).
+
 ### How the scheduler works
 
 `python -m nexus.daemon scheduler` runs a loop. Any number of replicas may run; one at a time holds the leader lease, a PostgreSQL row with a monotonically increasing **fencing token**. Every write the leader makes re-checks its token under `SELECT … FOR SHARE`, so a paused, deposed leader cannot commit. Each pass the leader:
 
 1. **Relays the outbox.** It publishes due dispatch messages (`available_at <= now()`) to the `nexus.jobs` exchange with publisher confirms. A message only marks its job QUEUED after the broker confirms it. Unroutable or nacked messages stay in the outbox and are retried.
-2. **Detects dead workers.** It marks workers whose heartbeat is older than `WORKER_HEARTBEAT_TTL_SECONDS` as unhealthy. Their RUNNING jobs are failed and retried.
+2. **Detects dead workers.** Once its observation window spans a full TTL (see above), it treats workers whose heartbeat is older than `WORKER_HEARTBEAT_TTL_SECONDS` as dead. Their RUNNING jobs are failed (`lost`) and retried.
 3. **Expires leases.** It fails a RUNNING attempt whose execution lease (timeout + grace) has expired, which retries it or dead-letters it.
-4. **Prunes resolved dead letters.** It removes `nexus.dead-letter` messages whose job is no longer dead-lettered for that attempt, because the job was retried. Messages for jobs still dead-lettered, task messages and unparseable (poison) messages are kept. So the broker count matches the dashboard's count of dead-lettered jobs, while each job's full history stays in the database. Turn this off with `DEAD_LETTER_PRUNE_RESOLVED=false`.
+4. **Prunes resolved dead letters.** It removes `nexus.dead-letter` messages whose job is no longer dead-lettered for that attempt, because the job was retried. Messages for jobs still dead-lettered, task messages and unparseable (poison) messages are kept. Each job's full history stays in the database. The broker holds a message only for final failures a worker reported; jobs dead-lettered by scheduler recovery (dead worker, expired lease, hand-back on the last attempt) have none, so the broker count can be lower than the dashboard's. Turn this off with `DEAD_LETTER_PRUNE_RESOLVED=false`.
 
 On Vercel, steps 1–3 also run from the `/internal/maintenance` cron as a backstop, and `POST /internal/dead-letter/prune` does step 4 on demand.
 
@@ -277,14 +316,14 @@ On Vercel, steps 1–3 also run from the `/internal/maintenance` cron as a backs
 
 `python -m nexus.daemon worker`:
 
-1. **Registers.** Records id, hostname and capacity, and heartbeats on database time.
-2. **Consumes.** Takes from `nexus.jobs` with `prefetch = capacity`.
+1. **Registers.** Records id, hostname and capacity, and heartbeats on database time. Each successful heartbeat extends its execution authority.
+2. **Consumes.** Takes from `nexus.jobs` with `prefetch = capacity`, while it has authority.
 3. **Claims each delivery** in one transaction:
    - records an inbox entry (`job-executor:{message_id}`), so a redelivery is a no-op;
    - checks that the message's attempt is the job's current one;
    - moves the job QUEUED → RUNNING, with an execution row and lease.
-4. **Runs the handler** with the job's timeout.
-5. **Reports** COMPLETED or FAILED, fenced on `attempt` + `worker_id`, so a result from a worker that lost the job is discarded.
+4. **Runs the handler** in its own task with the job's timeout.
+5. **Reports** COMPLETED or FAILED, retrying through database blips, fenced on `attempt` + `worker_id`, so a result from a worker that lost the job is discarded. If the worker fenced before the handler finished, it hands the attempt back instead.
 
 On failure:
 - **Retryable:** the job moves FAILED → RETRYING and a new dispatch is written to the outbox, held back until `next_attempt_at`. The backoff is `initial_backoff_seconds · 2^(attempt-1)`, capped at `max_backoff_seconds`.
@@ -353,8 +392,16 @@ All configuration comes from environment variables (see `.env.example`). Outside
 | `API_KEYS` | `tenant:sha256(key),…`. Generate with `uv run python -m nexus.cli new-api-key <tenant>` |
 | `CORS_ALLOWED_ORIGINS` | Dashboard origin(s) when served from another domain |
 | `RATE_LIMIT_READS_PER_MINUTE`, `RATE_LIMIT_WRITES_PER_MINUTE` | Per tenant |
-| `WORKER_CAPACITY`, `WORKER_HEARTBEAT_*`, `WORKER_SHUTDOWN_GRACE_SECONDS` | Worker behaviour |
-| `JOB_DEFAULT_TIMEOUT_SECONDS`, `JOB_MAX_TIMEOUT_SECONDS`, `JOB_DEFAULT_MAX_ATTEMPTS` | Job limits |
+| `WORKER_CAPACITY` | Concurrent jobs per worker (default 4) |
+| `WORKER_HEARTBEAT_INTERVAL_SECONDS`, `WORKER_HEARTBEAT_TTL_SECONDS` | Heartbeat every 5 s; a worker silent for 30 s is dead (scheduler) |
+| `WORKER_SELF_FENCE_AFTER_SECONDS` | Worker stops executing this long after its last good heartbeat. Unset: TTL − max(2 × interval, 20% of TTL) = 20 s. Must be ≥ 2 × interval and < TTL − interval, or the worker refuses to start |
+| `WORKER_FAIL_STOP` | Exit the worker (code 70) if a handler is still alive TTL − interval (25 s) after the last good heartbeat (default `true`) |
+| `WORKER_SHUTDOWN_GRACE_SECONDS` | Graceful drain on SIGTERM (default 25 s; then up to 5 s more for reports) |
+| `WORKER_FORGET_AFTER_TTLS` | Deregister workers silent for this many TTLs (default 20) |
+| `SCHEDULER_LEASE_DURATION_SECONDS`, `DAEMON_TICK_INTERVAL_SECONDS` | Leader lease 15 s; maintenance pass every 5 s |
+| `TASK_LEASE_GRACE_SECONDS` | Execution lease = timeout + this grace (default 30 s) |
+| `JOB_REDISPATCH_AFTER_SECONDS` | Re-dispatch a job whose dispatch message seems lost (default 900 s) |
+| `JOB_DEFAULT_TIMEOUT_SECONDS`, `JOB_MAX_TIMEOUT_SECONDS`, `JOB_DEFAULT_MAX_ATTEMPTS` | Job limits (60 s, 3600 s, 3) |
 | `CRON_SECRET`, `METRICS_TOKEN` | Protect internal endpoints (compose default for `METRICS_TOKEN`: `local-metrics-token`) |
 | `DEAD_LETTER_PRUNE_RESOLVED`, `DEAD_LETTER_PRUNE_BATCH` | Scheduler pruning of resolved broker dead letters (default on, 200 per pass) |
 | `TASK_ENABLE_TEST_HANDLERS` | Registers `test.sleep`/`test.flaky`/`test.fail` (local and CI only) |
@@ -394,6 +441,14 @@ Because the fleet-wide figures come from durable state, they are complete and id
 | `nexus_workers{status}`, `nexus_worker_capacity_slots`, `nexus_worker_busy_slots` | Worker fleet |
 | `nexus_broker_up`, `nexus_broker_ready_messages`, `nexus_broker_consumers`, `nexus_broker_dead_letter_messages` | RabbitMQ |
 | `nexus_state_database_up` | Whether the state above could be read |
+
+Reliability counters, served by each daemon on `:8081/metrics`:
+
+| Metric | Meaning |
+|---|---|
+| `scheduler_dead_worker_sweeps_deferred_total` | Leader passes that skipped the dead-worker sweep (observation window not yet a full TTL) |
+| `nexus_worker_self_fences_total{reason}` | Times a worker fenced itself (`deadline` or `deregistered`) |
+| `nexus_worker_handbacks_total{result}` | Attempts handed back (`recorded`, or `already_recovered` by the scheduler) |
 
 **Alerts** (`deploy/observability/prometheus/alerts.yml`, unit-tested in `alerts.test.yml`):
 
@@ -447,6 +502,17 @@ The `e2e` suite (`tests/e2e/test_compose_stack.py`) uses only the public API and
 - a permanent failure making only one attempt;
 - summary counts that match the listing endpoints.
 
+Outage drills (opt-in, a few minutes; never stop a container: an in-process TCP gate cuts PostgreSQL off from the workers or scheduler under test, using the isolated `nexus_test` database):
+
+```bash
+NEXUS_C1_REPRO=1 scripts/test-integration.sh tests/integration/test_c1_postgres_outage_overlap.py -v -s -rs
+NEXUS_C1_REPRO=1 scripts/test-integration.sh tests/integration/test_worker_self_fencing_drills.py -v -s -rs
+NEXUS_C1_REPRO=1 NEXUS_C1_TIMINGS=real scripts/test-integration.sh \
+  tests/integration/test_c1_postgres_outage_overlap.py -k scheduler_reconnects_first -v -s -rs
+```
+
+Each prints its evidence (handler run times, executions, transitions) and fails if two attempts of the same job overlap.
+
 What the suites cover:
 - **Integration tests** run against real PostgreSQL, RabbitMQ and Redis:
   - job lifecycle and retries;
@@ -454,6 +520,8 @@ What the suites cover:
   - timeouts and idempotency;
   - unroutable publishes never being marked QUEUED;
   - dead-worker recovery and fencing of stale workers and leaders;
+  - the scheduler observation window and worker self-fencing (deregistration, pausing, hand-back, stranded claims, shutdown during a report, fail-stop);
+  - report retry through database blips and ambiguous commits;
   - graceful shutdown and the poison-message DLQ;
   - tenant isolation and rate limiting (in-process and Redis);
   - the outbox, inbox and leader election.
@@ -488,7 +556,7 @@ deploy/production/nexus.sh deploy                                   # backup, bu
 - troubleshooting;
 - the readiness checklist.
 
-The failure drills in `tests/e2e/test_production_resilience.py` (`-m resilience`) restart and kill real containers mid-job and verify that every job still finishes exactly once.
+The failure drills in `tests/e2e/test_production_resilience.py` (`-m resilience`) restart and kill real containers mid-job and verify that every job still finishes, with exactly one completed execution recorded. (Handlers can still run more than once; see the delivery guarantee under [Job lifecycle](#job-lifecycle).)
 
 ## Deploying to Vercel
 
@@ -517,6 +585,13 @@ It needs one setting: **Settings → Pages → Source: GitHub Actions**. Setup, 
 
 ## Known limitations
 
+- **At-least-once handlers.** Self-fencing prevents two attempts of a job from running *at the same time*, not one after the other: a crash after a side effect but before the result is recorded re-runs the handler. Use the idempotency key for external side effects.
+- **H-1: infrastructure failures consume the retry budget.** Shutdown, crash recovery, self-fencing hand-backs, stranded claims and lease expiry are all recorded as failed attempts. A `max_attempts=1` job interrupted by a deploy or a PostgreSQL outage longer than 20 s is dead-lettered although its handler never failed. See [docs/ROADMAP.md](docs/ROADMAP.md).
+- **Self-fencing covers the RabbitMQ worker daemon only.** Not covered:
+  - the **Vercel job path** (`EVENT_BUS=vercel_queues`): Functions do not heartbeat, so only lease expiry protects it;
+  - the **tasks DAG pipeline** (`/tasks`, `TaskExecutor`): unchanged, attempt-guarded, no self-fencing or report retry;
+  - the **cron maintenance endpoint** (`/internal/maintenance`): stateless, so it has no observation window and sweeps dead workers immediately.
+- **A PostgreSQL outage longer than 20 s interrupts running jobs.** A worker cannot tell "everyone lost the database" from "only I did", so it stops and the attempts are retried.
 - **Vercel Daemons are in public beta** and run only on production deployments. Preview deployments have an API but no scheduler or workers. The `/internal/maintenance` cron relays the outbox, but cannot execute jobs.
 - **Vercel hosts no RabbitMQ.** A managed AMQP broker (for example CloudAMQP) is required in production.
 - **Broker dead letters are not replayed.** Messages in `nexus.dead-letter` are evidence, not a work queue. Retrying a job writes a new dispatch, and the scheduler then prunes the old message. Until the next scheduler pass (every few seconds), the broker count can briefly exceed the dashboard's. Without the scheduler daemon (for example on Vercel preview deployments), call `POST /internal/dead-letter/prune`.

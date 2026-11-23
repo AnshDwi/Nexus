@@ -7,9 +7,10 @@ Questions you're likely to get about NEXUS, with answers grounded in the code. *
 - a transactional outbox publishes them to RabbitMQ with publisher confirms;
 - workers claim each delivery through an inbox table and run it with a timeout;
 - failures retry with exponential backoff and end up dead-lettered;
-- a leader-elected scheduler with fencing tokens recovers jobs from dead workers.
+- a leader-elected scheduler with fencing tokens recovers jobs from dead workers, but only judges workers it could actually observe;
+- workers fence themselves when they lose PostgreSQL, so a job is never run by two workers at the same time.
 
-It has a React dashboard, Prometheus metrics computed from durable state, and failure drills in CI that kill real containers mid-job and assert every job completes exactly once."
+It has a React dashboard, Prometheus metrics computed from durable state, and failure drills that kill real containers or cut workers off from the database mid-job and check that every job finishes with exactly one completed execution and no overlapping attempts. Handlers are at-least-once; I don't claim exactly-once side effects."
 
 ---
 
@@ -57,9 +58,10 @@ Middleware in `main.py` sets `X-Request-ID` and `X-Correlation-ID`, stored in a 
 
 **Q: Can a job execute more than once?**
 
-**Yes, the handler can. State transitions can't.**
-- **State transitions are effectively-once.** Duplicate *deliveries* are dropped by the inbox (`claim_job` → DUPLICATE). Stale messages are dropped by attempt checks (→ STALE). Results from a superseded worker are rejected (`_live_attempt` checks `attempt` + `worker_id`).
-- **The handler is at-least-once.** If a worker runs the handler and dies before reporting, the scheduler retries, and the handler runs again as attempt 2. True exactly-once execution of external side effects isn't possible without the external system's cooperation, so handlers with side effects should be idempotent. For example, pass `job_id` + `attempt` as an idempotency key to the webhook target.
+**Yes, the handler can, one run after another. Never two at once. State transitions can't repeat.**
+- **State transitions are effectively-once.** Duplicate *deliveries* are dropped by the inbox (`claim_job` → DUPLICATE). Stale messages are dropped by attempt checks (→ STALE). Results from a superseded worker are rejected (`_live_attempt` checks `attempt` + `worker_id` under the row lock).
+- **No concurrent duplicates.** A worker that loses PostgreSQL stops its handlers 20 s after its last good heartbeat (self-fencing), before the scheduler can declare it dead at 30 s; the scheduler doesn't declare anyone dead until it has watched heartbeats for a full TTL (observation window). Proven by drills that cut one worker off and record each handler's start and end.
+- **Sequential duplicates remain: the handler is at-least-once.** If a worker runs the handler and dies before reporting, the scheduler retries, and the handler runs again as attempt 2. Exactly-once external side effects aren't possible without the receiver's cooperation. Handlers get `TaskContext.idempotency_key`, the job ID, which is the same for every attempt; `http.webhook` sends it as `Idempotency-Key`. (It must not include the attempt number, or every retry would look new to the receiver.)
 
 **Q: What happens if a worker crashes after receiving a job?**
 
@@ -69,7 +71,7 @@ Two cases:
   1. RabbitMQ redelivers the unacked message;
   2. the next worker's `claim_job` finds the inbox key already present (DUPLICATE) and acks without running;
   3. the crashed worker's heartbeat stops;
-  4. after `WORKER_HEARTBEAT_TTL_SECONDS` (30), the leader's `recover_jobs` fails the attempt as `lost`;
+  4. after `WORKER_HEARTBEAT_TTL_SECONDS` (30), the leader's `recover_jobs` fails the attempt as `lost` (provided its observation window already spans a TTL; otherwise one TTL later);
   5. a **new** dispatch (attempt N+1) goes through the outbox.
 
   If the "crashed" worker comes back and reports late, `_live_attempt` rejects it. This is covered by `test_dead_worker_jobs_are_recovered_and_stale_worker_is_fenced` and the production drill `test_killed_workers_are_detected_and_their_jobs_retried`.
@@ -96,7 +98,46 @@ If the relay crashes after the broker confirms but before it commits, it republi
 
 **Q: Clocks?**
 
-All timing decisions (leases, heartbeats, backoff) use the database clock (`store.now()` / `now()` in SQL), so process clock skew doesn't matter.
+Leases, heartbeat ages, backoff and dead-worker verdicts use the database clock (`store.now()` / `now()` in SQL), so process clock skew doesn't matter. The one local clock is the worker's self-fencing deadline: a monotonic clock measured from the *start* of its last successful heartbeat. The database stamps the heartbeat later than that start, so the worker's deadline always falls before the scheduler's verdict. It needs the clocks to tick at the same rate, not to agree; the margin (10 s with defaults) absorbs drift and cancellation latency.
+
+**Q: What happens to running jobs during a PostgreSQL outage?**
+- **Under 20 s:** nothing visible. Claims fail and are requeued; a finished job's report retries until it commits (C2 fix, `JobExecutor._report`). No job re-runs.
+- **Over 20 s:** every worker fences: it cancels its handlers, stops consuming, and hands the attempts back (`lost`, retried) once PostgreSQL returns. The scheduler, after reconnecting, waits a full TTL of observation before declaring anyone dead, so workers that come back keep their registration.
+- **Why stop at all if everyone lost the database?** A worker can't tell a global outage from being partitioned alone. If it's alone, the scheduler *will* retry its job at 30 s. Stopping costs a retry; not stopping risks two concurrent copies.
+
+**Q: The original bug (C1): how did you find and prove it?**
+
+Audit by reading the recovery path, then a reproduction before any fix: an in-process TCP proxy between PostgreSQL and the workers/scheduler, so an outage can be simulated without stopping a container; a wrapped handler records each run's start and end. Scheduler reconnecting first, production timings: attempt 2 started at 46.5 s while attempt 1 ran until 150.4 s, 104 s of overlap. After fix 1 (observation window) that scenario passed; a worker-only partition still overlapped by 24 s until fix 2 (self-fencing). Both drills are in the repo (`test_c1_postgres_outage_overlap.py`, `test_worker_self_fencing_drills.py`).
+
+**Q: Why an observation window rather than a longer TTL?**
+
+A longer TTL only moves the problem: an outage longer than the new TTL produces the same false verdicts, and real crashes are detected later every time. The window costs nothing in steady state and only delays the sweep after an interruption, by exactly one TTL. Lease expiry and everything else keep running.
+
+**Q: Why self-fencing on the worker instead of renewing a per-job lease?**
+
+Lease renewal is a database write, so it fails in exactly the situation we care about (the worker can't reach PostgreSQL); the worker still wouldn't know whether its lease was taken. What matters is that the worker stops *before* anyone may take over, which it can compute locally from its last successful heartbeat. Handlers are already bounded by their timeout, and the job lease (timeout + grace) still backs that up.
+
+**Q: Why sticky epochs?**
+
+Because "a heartbeat succeeded again" says nothing about the gap before it. If a worker was silent for 40 s, the scheduler may already have retried its job. Fencing bumps the epoch; attempts from the old epoch can never report success, only be handed back, while new work after recovery runs under the new epoch.
+
+**Q: A handler finished in time, but its result can only be written after the worker's authority lapsed. Accept it?**
+
+Yes (design "option A"): authority is required while *executing*; recording is a compare-and-set on the attempt. If the scheduler already recovered the attempt, the report is rejected; if not, nobody else acted on it and recording it avoids a needless re-run. Rejecting late-but-valid results with an extra lease check would *add* duplicate side effects. A handler that finished after the fence is never reported, only handed back.
+
+**Q: What if a handler ignores cancellation or blocks the event loop?**
+
+Cancellation in asyncio is cooperative, and a blocked loop also stops the heartbeat and the fencing watchdog. So a separate thread (`infrastructure/coordination/fail_stop.py`) exits the process (code 70) if any handler is still alive TTL − interval (25 s) after the last good heartbeat. Every attempt in the process has lost authority by then, so exiting kills nothing that was still allowed to run; Docker restarts it and the scheduler retries. Tests inject the exit function; it is never armed when tests construct a worker directly.
+
+**Q: What was C2?**
+
+After a handler finished, the worker tried to record the result 3 times over about 1.5 s, then gave up and acked the message. The job sat RUNNING until its lease expired, and the scheduler re-ran it. Now `_report` retries until the report commits, is rejected, or the attempt's lease deadline passes; a commit with a lost reply is read back. Reproduced first (2.5 s outage → handler ran twice), then fixed (→ ran once).
+
+**Q: Any other edge you found while doing this?**
+
+Two:
+- **Stranded claims.** If the claim's COMMIT succeeds but the reply is lost, the worker requeues; the redelivery is an inbox duplicate, and the job would sit RUNNING with no handler until its lease expired. Now the worker sees the job RUNNING under itself with nothing running and hands it back.
+- **Draining without heartbeats.** My first self-fencing version stopped heartbeating when shutdown began, so a job finishing late in a 25 s drain would lose authority and be re-run. A real container restart in testing showed it; I added a failing test, then kept heartbeating until the drain ends.
 
 ## RabbitMQ
 
@@ -226,7 +267,7 @@ SIGTERM → the worker marks itself draining, stops consuming, gives in-flight j
 - a broker outage;
 - a full stop and start.
 
-It then asserts that every job completed **exactly once**. It runs in CI against the official images.
+It then asserts that every job finished with **exactly one completed execution** recorded. That is about state, not handler runs: an attempt interrupted by a crash is recorded `lost` and its handler may have run partly or fully. It runs in CI against the official images.
 
 ## Reliability and failure scenarios
 
@@ -245,11 +286,11 @@ It then asserts that every job completed **exactly once**. It runs in CI against
 
 **Q: A job hangs forever. Then what?**
 
-`asyncio.wait_for` enforces `timeout_seconds`. If the whole worker hangs, so the timeout can't fire, the job's **execution lease** (`timeout + TASK_LEASE_GRACE_SECONDS`) expires, and the scheduler fails it (`timed_out`) and retries.
+`asyncio.wait_for` enforces `timeout_seconds`. If the handler ignores cancellation or blocks the event loop, heartbeats stop and the fail-stop thread exits the worker 25 s after the last good heartbeat. As a final backstop, the job's **execution lease** (`timeout + TASK_LEASE_GRACE_SECONDS`) expires, and the scheduler fails it (`timed_out`) and retries.
 
 **Q: What if the scheduler dies?**
 
-Jobs keep running: the workers and the API's eager relay don't need it. But retries wait (their dispatch sits in the outbox), and recovery pauses. A second scheduler replica would take over within the 15-second lease. Docker restarts the crashed process (`restart: unless-stopped`).
+Jobs keep running: the workers and the API's eager relay don't need it. But retries wait (their dispatch sits in the outbox), and recovery pauses. A second scheduler replica would take over within the 15-second lease. Docker restarts the crashed process (`restart: unless-stopped`). A new leader starts with an empty observation window, so it declares no worker dead during its first TTL: dead-worker recovery is one TTL slower after a failover, by design.
 
 ## Scaling and design trade-offs
 
@@ -295,7 +336,10 @@ The **jobs** API has no dependencies. 🔮 Unifying them would mean:
 See ROADMAP phase 3.
 
 **Q: What are the limitations of the current design?**
-- **At-least-once handler execution:** side effects can repeat.
+- **At-least-once handler execution:** side effects can repeat (one after another, never concurrently).
+- **H-1, interrupted attempts consume retries:** shutdown, crash recovery, self-fencing hand-backs and lease expiry each count against `max_attempts`, so a `max_attempts=1` job can be dead-lettered by a deploy or a long PostgreSQL outage. Documented in ROADMAP; the likely fix is to stop counting `lost` attempts, or cap them separately.
+- **Outages over 20 s interrupt running jobs:** the price of never running two copies at once.
+- **Coverage gaps:** self-fencing and report retry apply to the RabbitMQ worker daemon only. The Vercel job path relies on lease expiry alone (Functions don't heartbeat), the tasks DAG pipeline (`TaskExecutor`) is unchanged, and the stateless cron maintenance endpoint has no observation window.
 - **One PostgreSQL:** it's the bottleneck and the single point of failure. Every state change is a write.
 - **One job queue:** no fair scheduling across tenants and no per-type isolation (a slow type shares capacity with fast ones).
 - **Polling:** the relay polls every second, and redispatch of lost messages waits 15 minutes. 🔮 `LISTEN/NOTIFY` could make relaying event-driven.
@@ -316,6 +360,9 @@ Honest options:
 | Setting | Default | File |
 |---|---|---|
 | Heartbeat interval / TTL | 5 s / 30 s | `infrastructure/config.py` |
+| Worker self-fences / fail-stop | 20 s / 25 s after the last good heartbeat | `worker_self_fence_after_seconds`, `worker_fail_stop` |
+| Observation window before dead-worker sweeps | 1 TTL (30 s) of uninterrupted leadership | `observation_window.py` |
+| Report retry backoff | 0.5 s doubling to 5 s, until the lease deadline | `job_executor.py` |
 | Leader lease | 15 s | `scheduler_lease_duration_seconds` |
 | Maintenance tick / relay poll | 5 s / 1 s | `daemon_tick_interval_seconds`, `outbox_relay_poll_interval_seconds` |
 | Worker shutdown grace | 25 s | `worker_shutdown_grace_seconds` |

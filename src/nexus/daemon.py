@@ -35,6 +35,7 @@ from uuid import uuid4
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from nexus.infrastructure.config import EventBus, Settings, get_settings
+from nexus.infrastructure.coordination.observation_window import HeartbeatObservationWindow
 from nexus.infrastructure.db.session import create_engine, create_session_factory
 from nexus.infrastructure.execution.maintenance import run_maintenance_pass
 from nexus.infrastructure.messaging.dead_letter import prune_resolved_dead_letters
@@ -123,6 +124,12 @@ async def run_scheduler(settings: Settings, stop: asyncio.Event) -> None:
             "to the Functions (eager relay and cron), whose messages reach the push consumer"
         )
     heartbeat = Heartbeat(stall_after_seconds=max(settings.daemon_tick_interval_seconds * 6, 60))
+    # Workers are only declared dead once this replica has led, with working
+    # database access, for a full heartbeat TTL (see observation_window.py).
+    observation = HeartbeatObservationWindow(
+        ttl_seconds=settings.worker_heartbeat_ttl_seconds,
+        lease_seconds=settings.scheduler_lease_duration_seconds,
+    )
     server = await serve_health(heartbeat, settings.daemon_health_port)
     logger.info("scheduler daemon started", extra={"replica_id": str(replica_id)})
 
@@ -159,6 +166,7 @@ async def run_scheduler(settings: Settings, stop: asyncio.Event) -> None:
                     replica_id=replica_id,
                     trigger="daemon",
                     relay=relay,
+                    observation=observation,
                 )
                 heartbeat.beat()
                 if report.leader and prune_connection is not None:
@@ -196,6 +204,16 @@ async def run_rabbitmq_worker(settings: Settings, stop: asyncio.Event) -> None:
     from nexus.infrastructure.messaging.rabbitmq import create_rabbitmq_connection
     from nexus.infrastructure.messaging.rabbitmq_worker import RabbitMQJobWorker, WorkerConfig
 
+    # Validated first: unsafe self-fencing settings refuse to start (ValueError)
+    # before any connection is opened.
+    config = WorkerConfig(
+        capacity=settings.worker_capacity,
+        heartbeat_interval=settings.worker_heartbeat_interval_seconds,
+        shutdown_grace=settings.worker_shutdown_grace_seconds,
+        heartbeat_ttl=settings.worker_heartbeat_ttl_seconds,
+        fence_after=settings.worker_self_fence_after_seconds,
+        fail_stop=settings.worker_fail_stop,
+    )
     engine = create_engine(settings.database_url, settings)
     session_factory = create_session_factory(engine)
     connection = await create_rabbitmq_connection(settings.rabbitmq_url)
@@ -214,11 +232,7 @@ async def run_rabbitmq_worker(settings: Settings, stop: asyncio.Event) -> None:
             lease_grace=timedelta(seconds=settings.task_lease_grace_seconds),
         ),
         task_executor=TaskExecutor(session_factory, handlers, publisher.publisher, settings),
-        config=WorkerConfig(
-            capacity=settings.worker_capacity,
-            heartbeat_interval=settings.worker_heartbeat_interval_seconds,
-            shutdown_grace=settings.worker_shutdown_grace_seconds,
-        ),
+        config=config,
     )
     heartbeat = Heartbeat(stall_after_seconds=settings.worker_heartbeat_ttl_seconds)
     server = await serve_health(heartbeat, settings.daemon_health_port)

@@ -71,6 +71,27 @@ async def test_failover_after_expiry_transfers_holder_and_increments_token(
     assert taken_by_b.fencing_token == acquired_by_a.fencing_token + 1
 
 
+async def test_newly_acquired_marks_each_start_of_a_leadership_term(leader_lease_session_factory):
+    lease_name = f"test-{uuid4()}"
+    replica_a, replica_b = uuid4(), uuid4()
+    short = timedelta(milliseconds=50)
+
+    first = await _attempt(leader_lease_session_factory, replica_a, lease_name)
+    assert first.is_leader and first.newly_acquired  # first acquisition
+    renewed = await _attempt(leader_lease_session_factory, replica_a, lease_name, short)
+    assert renewed.is_leader and not renewed.newly_acquired  # live renewal
+
+    await asyncio.sleep(0.15)  # A's lease lapses; nobody takes it
+    lapsed_renewal = await _attempt(leader_lease_session_factory, replica_a, lease_name, short)
+    assert lapsed_renewal.is_leader and lapsed_renewal.newly_acquired
+
+    await asyncio.sleep(0.15)
+    taken_by_b = await _attempt(leader_lease_session_factory, replica_b, lease_name)
+    assert taken_by_b.is_leader and taken_by_b.newly_acquired  # takeover
+    rejected_a = await _attempt(leader_lease_session_factory, replica_a, lease_name)
+    assert not rejected_a.is_leader and not rejected_a.newly_acquired
+
+
 async def test_zombie_leader_is_rejected_indefinitely_after_failover(leader_lease_session_factory):
     lease_name = f"test-{uuid4()}"
     replica_a, replica_b = uuid4(), uuid4()

@@ -1,11 +1,11 @@
 import logging
 import time
 from collections.abc import Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Row, delete, select, update
+from sqlalchemy import Row, delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -94,7 +94,10 @@ class PostgresWorkerRegistry:
         self, worker_id: UUID, capabilities: WorkerCapabilities, capacity_slots: int
     ) -> WorkerRegistration:
         try:
-            now = datetime.now(UTC)
+            # Database clock, not this process's: heartbeats are compared
+            # against the scheduler's notion of "now", which may run on
+            # another machine.
+            now = (await self._session.execute(select(func.statement_timestamp()))).scalar_one()
             existed = (
                 await self._session.execute(
                     select(WorkerRegistrationModel.worker_id).where(
@@ -155,7 +158,7 @@ class PostgresWorkerRegistry:
             stmt = (
                 update(WorkerRegistrationModel)
                 .where(WorkerRegistrationModel.worker_id == worker_id)
-                .values(last_heartbeat_at=datetime.now(UTC))
+                .values(last_heartbeat_at=func.statement_timestamp())
                 .returning(*_RETURNING_COLUMNS)
             )
             row = (await self._session.execute(stmt)).first()
@@ -226,7 +229,7 @@ class PostgresWorkerRegistry:
 
     async def list_dead_workers(self, ttl: timedelta) -> list[WorkerRegistration]:
         try:
-            cutoff = datetime.now(UTC) - ttl
+            cutoff = func.statement_timestamp() - ttl
             rows: Sequence[Row[Any]] = (
                 await self._session.execute(
                     select(*_RETURNING_COLUMNS).where(
@@ -251,3 +254,17 @@ class PostgresWorkerRegistry:
             ).inc()
             logger.error("list_dead_workers failed", exc_info=exc)
             raise
+
+    async def list_workers(self) -> list[WorkerRegistration]:
+        rows: Sequence[Row[Any]] = (
+            await self._session.execute(
+                select(*_RETURNING_COLUMNS).order_by(WorkerRegistrationModel.registered_at)
+            )
+        ).all()
+        return [_row_to_registration(row) for row in rows]
+
+    async def database_now(self) -> "datetime":
+        value: datetime = (
+            await self._session.execute(select(func.statement_timestamp()))
+        ).scalar_one()
+        return value

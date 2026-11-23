@@ -1,87 +1,298 @@
+# NEXUS local stack:  docker compose up --build   ->   http://localhost:5173
+#
+#   dashboard     React dashboard (production build, proxies /api to `api`)
+#   api           FastAPI                                  :8000
+#   scheduler     leader-elected outbox relay + job recovery (fencing tokens)
+#   worker        RabbitMQ job worker, capacity 4
+#   worker-small  RabbitMQ job worker, capacity 2
+#   migrate       one-shot `alembic upgrade head`, gates everything else
+#   postgres / rabbitmq / redis   infrastructure with persistent volumes
+#   seed          OPTIONAL demo data (profile "demo", never runs by default)
+#   prometheus / grafana   OPTIONAL monitoring (profile "observability"):
+#                 docker compose --profile observability up -d
+#                 Prometheus :9090 (alert rules), Grafana :3000 (NEXUS dashboard)
+#
+# Startup order is enforced with health checks:
+#   postgres ─► migrate ─┐
+#   rabbitmq ────────────┼─► api ─► dashboard
+#   redis ───────────────┘   scheduler, worker, worker-small
+#
+# Base images can be pointed at an internal registry with NEXUS_*_IMAGE
+# (see .env.example). Configuration comes from .env (optional; every value
+# has a local default) — container-specific hosts are set below and win.
+name: nexus
+
+x-app-build: &app-build
+  context: .
+  args:
+    PYTHON_IMAGE: ${NEXUS_PYTHON_IMAGE:-python:3.12-slim}
+
+x-app-env: &app-env
+  ENVIRONMENT: ${ENVIRONMENT:-local}
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: ${POSTGRES_USER:-nexus}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nexus}
+  POSTGRES_DB: ${POSTGRES_DB:-nexus}
+  EVENT_BUS: rabbitmq
+  RABBITMQ_HOST: rabbitmq
+  RABBITMQ_PORT: "5672"
+  RABBITMQ_USER: ${RABBITMQ_USER:-nexus}
+  RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-nexus}
+  REDIS_URL: redis://redis:6379/0
+  # Local development key "dev-key" for tenant "dev" (see README). Override
+  # API_KEYS in .env; generate keys with `python -m nexus.cli new-api-key`.
+  API_KEYS: ${API_KEYS:-dev:7e9f8fd111802be56c379d597842e29b2cebd35ff2133d431a49fa556a18704e}
+  CRON_SECRET: ${CRON_SECRET:-local-cron-secret}
+  # Guards /api/v1/internal/metrics (scraped by the optional Prometheus).
+  METRICS_TOKEN: ${METRICS_TOKEN:-local-metrics-token}
+  TASK_ENABLE_TEST_HANDLERS: ${TASK_ENABLE_TEST_HANDLERS:-true}
+  WORKER_HEARTBEAT_TTL_SECONDS: ${WORKER_HEARTBEAT_TTL_SECONDS:-30}
+  WORKER_HEARTBEAT_INTERVAL_SECONDS: ${WORKER_HEARTBEAT_INTERVAL_SECONDS:-5}
+  WORKER_SHUTDOWN_GRACE_SECONDS: ${WORKER_SHUTDOWN_GRACE_SECONDS:-25}
+  OUTBOX_RELAY_POLL_INTERVAL_SECONDS: ${OUTBOX_RELAY_POLL_INTERVAL_SECONDS:-1}
+  DAEMON_TICK_INTERVAL_SECONDS: ${DAEMON_TICK_INTERVAL_SECONDS:-5}
+  JOB_DEFAULT_TIMEOUT_SECONDS: ${JOB_DEFAULT_TIMEOUT_SECONDS:-60}
+  JOB_DEFAULT_MAX_ATTEMPTS: ${JOB_DEFAULT_MAX_ATTEMPTS:-3}
+  RATE_LIMIT_READS_PER_MINUTE: ${RATE_LIMIT_READS_PER_MINUTE:-600}
+  RATE_LIMIT_WRITES_PER_MINUTE: ${RATE_LIMIT_WRITES_PER_MINUTE:-120}
+
+# The daemons serve GET /health on 8081 (used for liveness on Vercel too).
+x-daemon-health: &daemon-health
+  test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health', timeout=3)"]
+  interval: 10s
+  timeout: 5s
+  retries: 3
+  start_period: 20s
+
+x-app-deps: &app-deps
+  migrate:
+    condition: service_completed_successfully
+  rabbitmq:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+
 services:
-  api:
-    build: .
-    ports:
-      - "8000:8000"
-    environment:
-      POSTGRES_HOST: postgres
-      REDIS_HOST: redis
-      RABBITMQ_HOST: rabbitmq
-    env_file:
-      - .env
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
-    volumes:
-      - ./src:/app/src
-      - ./migrations:/app/migrations
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-
-  worker:
-    build: .
-    command: ["python", "-m", "nexus.worker"]
-    environment:
-      POSTGRES_HOST: postgres
-      RABBITMQ_HOST: rabbitmq
-    env_file:
-      - .env
-    depends_on:
-      postgres:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
-    volumes:
-      - ./src:/app/src
-      - ./migrations:/app/migrations
-
   postgres:
-    image: postgres:16-alpine
+    image: ${NEXUS_POSTGRES_IMAGE:-postgres:16-alpine}
     environment:
-      POSTGRES_USER: nexus
-      POSTGRES_PASSWORD: nexus
-      POSTGRES_DB: nexus
+      POSTGRES_USER: ${POSTGRES_USER:-nexus}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nexus}
+      POSTGRES_DB: ${POSTGRES_DB:-nexus}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U nexus -d nexus"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  rabbitmq:
+    image: ${NEXUS_RABBITMQ_IMAGE:-rabbitmq:3.13-management-alpine}
+    # RabbitMQ stores data under its node name, which derives from the
+    # hostname: pin it so the volume survives container re-creation.
+    hostname: nexus-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-nexus}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-nexus}
+    ports:
+      - "127.0.0.1:${RABBITMQ_HOST_PORT:-5672}:5672"
+      - "127.0.0.1:${RABBITMQ_MANAGEMENT_HOST_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
 
   redis:
-    image: redis:7-alpine
+    image: ${NEXUS_REDIS_IMAGE:-redis:7-alpine}
     ports:
-      - "6379:6379"
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 20
+    restart: unless-stopped
 
-  rabbitmq:
-    image: rabbitmq:3-management-alpine
-    environment:
-      RABBITMQ_DEFAULT_USER: nexus
-      RABBITMQ_DEFAULT_PASS: nexus
+  migrate:
+    build: *app-build
+    image: nexus-app:local
+    command: ["alembic", "upgrade", "head"]
+    environment: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: *app-build
+    image: nexus-app:local
+    environment: *app-env
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
+    depends_on: *app-deps
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 5s
+      # Readiness: answers only when Postgres, RabbitMQ and Redis respond.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/ready', timeout=4)"]
+      interval: 10s
+      timeout: 6s
+      retries: 6
+      start_period: 15s
+    stop_grace_period: 15s
+    restart: unless-stopped
+
+  scheduler:
+    build: *app-build
+    image: nexus-app:local
+    command: ["python", "-m", "nexus.daemon", "scheduler"]
+    environment: *app-env
+    depends_on: *app-deps
+    healthcheck: *daemon-health
+    stop_grace_period: 20s
+    restart: unless-stopped
+
+  worker:
+    build: *app-build
+    image: nexus-app:local
+    command: ["python", "-m", "nexus.daemon", "worker"]
+    environment:
+      <<: *app-env
+      WORKER_CAPACITY: ${WORKER_CAPACITY:-4}
+    depends_on: *app-deps
+    healthcheck: *daemon-health
+    # Longer than WORKER_SHUTDOWN_GRACE_SECONDS: in-flight jobs finish (or
+    # are handed back for retry) before Docker sends SIGKILL.
+    stop_grace_period: 40s
+    restart: unless-stopped
+
+  worker-small:
+    build: *app-build
+    image: nexus-app:local
+    command: ["python", "-m", "nexus.daemon", "worker"]
+    environment:
+      <<: *app-env
+      WORKER_CAPACITY: ${WORKER_SMALL_CAPACITY:-2}
+    depends_on: *app-deps
+    healthcheck: *daemon-health
+    stop_grace_period: 40s
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: ./frontend
+      args:
+        NODE_IMAGE: ${NEXUS_NODE_IMAGE:-node:22-alpine}
+    image: nexus-dashboard:local
+    environment:
+      NEXUS_API_PROXY: http://api:8000
+    ports:
+      - "127.0.0.1:${DASHBOARD_HOST_PORT:-5173}:5173"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:5173/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
       timeout: 5s
-      retries: 10
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+
+  # Optional demo scenario. Never starts with `docker compose up`; run it
+  # explicitly:  docker compose --profile demo run --rm seed
+  # It submits jobs through the public API (no direct database writes) and
+  # refuses to run against a non-local environment.
+  seed:
+    profiles: ["demo"]
+    build: *app-build
+    image: nexus-app:local
+    command: ["python", "-m", "nexus.demo", "seed", "--api-url", "http://api:8000", "--wait"]
+    environment:
+      NEXUS_API_KEY: ${DEMO_API_KEY:-dev-key}
+    depends_on:
+      api:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
+      worker-small:
+        condition: service_healthy
+    restart: "no"
+
+  # Optional monitoring:  docker compose --profile observability up -d
+  prometheus:
+    profiles: ["observability"]
+    image: ${NEXUS_PROMETHEUS_IMAGE:-prom/prometheus:v3.5.0}
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-7d}
+    configs:
+      - source: metrics_token
+        target: /run/secrets/metrics_token
+    volumes:
+      - ./deploy/observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/observability/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:${PROMETHEUS_HOST_PORT:-9090}:9090"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+
+  grafana:
+    profiles: ["observability"]
+    image: ${NEXUS_GRAFANA_IMAGE:-grafana/grafana:12.2.1}
+    environment:
+      # Local only (port bound to 127.0.0.1): read-only anonymous access to the
+      # provisioned dashboard. Set GRAFANA_ADMIN_PASSWORD to sign in and edit.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/nexus.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./deploy/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/observability/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:${GRAFANA_HOST_PORT:-3000}:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    restart: unless-stopped
+
+configs:
+  metrics_token:
+    content: ${METRICS_TOKEN:-local-metrics-token}
 
 volumes:
   postgres_data:
+  rabbitmq_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
